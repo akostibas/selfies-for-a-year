@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: refuse to add lines containing any of $BANNED_NAMES.
+#
+# Background: some real personal names have leaked into examples, ADRs,
+# and agent prompts over time. The repo is public and the people they
+# refer to didn't sign up for that. This hook keeps new occurrences out.
+#
+# What it checks:
+#   - Only the lines being ADDED in this commit (not file contents at
+#     rest). Pre-existing names already in the tree don't trigger.
+#   - Match is case-insensitive and word-boundary, so a banned token
+#     "foo" matches "Foo" but not "footprint".
+#
+# Source of $BANNED_NAMES:
+#   - The environment, if set (typical: direnv loads .envrc).
+#   - Otherwise this script is a no-op. The hook is intended for
+#     contributors who care about the policy; CI without direnv will
+#     simply skip.
+#
+# Bypass for a single commit (use sparingly, with reason in the commit
+# message): `git commit --no-verify`.
+
+set -euo pipefail
+
+if [[ -z "${BANNED_NAMES:-}" ]]; then
+    # No policy configured for this environment; nothing to check.
+    exit 0
+fi
+
+# Build a single regex like "\b(foo|bar|baz)\b" from the configured
+# tokens. Word boundaries matter — without them, "foo" matches "footer"
+# and we get a flood of false positives.
+read -r -a banned <<< "$BANNED_NAMES"
+if [[ ${#banned[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+regex="\b("
+for i in "${!banned[@]}"; do
+    [[ $i -gt 0 ]] && regex+="|"
+    regex+="${banned[$i]}"
+done
+regex+=")\b"
+
+# Pull the added lines (lines starting with `+` but not `+++` file
+# headers) from the staged diff, paired with their file paths so error
+# messages are useful. --no-color avoids ANSI escapes inside grep input.
+hits=$(git diff --cached --no-color --unified=0 -- "$@" \
+    | awk '
+        /^\+\+\+ b\// { file = substr($0, 7); next }
+        /^@@/         { match($0, /\+[0-9]+/); line = substr($0, RSTART+1, RLENGTH-1) + 0; next }
+        /^\+/ && !/^\+\+\+/ {
+            sub(/^\+/, "", $0)
+            print file ":" line "\t" $0
+            line += 1
+        }
+    ' \
+    | grep -i -E "$regex" || true)
+
+if [[ -z "$hits" ]]; then
+    exit 0
+fi
+
+echo "banned-names: refusing to add lines matching /$regex/i" >&2
+echo >&2
+while IFS= read -r line; do
+    echo "  $line" >&2
+done <<< "$hits"
+echo >&2
+echo "Use a fictional name, or pass --no-verify if you have a legitimate reason" >&2
+echo "(e.g., editing a real prod runbook entry) and explain it in the commit message." >&2
+exit 1

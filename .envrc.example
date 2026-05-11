@@ -1,0 +1,5 @@
+# Copy to .envrc (gitignored) and customize. Used by direnv to populate
+# the shell env when entering the repo. The banned-names pre-commit hook
+# reads BANNED_NAMES to refuse new lines containing real personal names —
+# leave it empty to disable, or list space-separated tokens.
+export BANNED_NAMES=""

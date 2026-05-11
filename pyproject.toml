@@ -1,0 +1,25 @@
+[project]
+name = "selfies-for-a-year"
+version = "0.1.0"
+description = "Turn years of daily selfies into an aligned, face-centered timelapse video"
+readme = "README.md"
+authors = [
+    { name = "Alexi Kostibas", email = "alexi@kostibas.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.15",
+    "Pillow>=11",
+    "rich>=14",
+    "mediapipe>=0.10",
+    "numpy>=2",
+    "pillow-heif>=0.21",
+    "librosa>=0.11.0",
+]
+
+[project.scripts]
+selfies-for-a-year = "selfies_for_a_year.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"

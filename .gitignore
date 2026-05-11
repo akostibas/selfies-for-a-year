@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.mp4
+*.mov
+*.gif
+.DS_Store
+models/
+local.env
+.claude/
+.envrc
