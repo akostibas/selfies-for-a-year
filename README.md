@@ -15,7 +15,7 @@ Install system dependencies:
 brew install uv ffmpeg
 ```
 
-Clone the repo, install, and download the face detection model:
+Clone the repo, install, and download the two face-detection models:
 
 ```bash
 git clone https://github.com/akostibas/selfies-for-a-year.git
@@ -23,6 +23,8 @@ cd selfies-for-a-year
 uv sync
 curl -L -o models/face_landmarker.task --create-dirs \
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+curl -L -o models/blaze_face_short_range.tflite --create-dirs \
+  "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
 ```
 
 `uv sync` creates an isolated virtual environment and installs all Python dependencies. Your system Python is not modified.
