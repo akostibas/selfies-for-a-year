@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=2",
     "pillow-heif>=0.21",
     "librosa>=0.11.0",
+    "pyobjc-framework-photos>=12.1",
 ]
 
 [project.scripts]

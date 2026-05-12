@@ -362,6 +362,130 @@ _SourceItem = tuple[Path, datetime, _FaceHint, _AppleQuality]
 ManifestEntry = tuple[datetime, Path, str, str]
 
 
+def _maybe_materialize_from_icloud(
+    photos: list,
+    *,
+    width: int,
+    height: int,
+    min_face_fraction: float,
+    threshold: float,
+    force: bool,
+    manifest: list,
+) -> list:
+    """If too few originals are on disk, offer to screen derivatives and
+    download just the keepers from iCloud.
+
+    Returns the (possibly path-rewritten) photo list. Any photo that
+    remains unmaterialized after this call gets dropped with a manifest
+    entry — the rest of the pipeline assumes paths point at real files.
+    """
+    on_disk = sum(1 for p in photos if p.is_materialized)
+    total = len(photos)
+    if total == 0:
+        return photos
+    rate = on_disk / total
+    if rate >= threshold:
+        # Drop any stragglers that aren't on disk and tell the user.
+        kept = []
+        for p in photos:
+            if p.is_materialized:
+                kept.append(p)
+            else:
+                manifest.append((
+                    p.date, p.path, "dropped",
+                    "original not on disk (iCloud); above materialize threshold so skipped silently",
+                ))
+        if len(kept) != total:
+            typer.echo(
+                f"Apple Photos: {on_disk}/{total} originals on disk "
+                f"({100*rate:.0f}%) — dropping {total - on_disk} iCloud-only frames."
+            )
+        return kept
+
+    typer.echo(
+        f"Apple Photos: only {on_disk}/{total} originals on disk "
+        f"({100*rate:.0f}%) — looks like Optimize Mac Storage is on."
+    )
+
+    if not force:
+        try:
+            ans = input(
+                f"Screen local thumbnails and download missing originals from iCloud "
+                f"to /tmp? [y/N] "
+            ).strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            typer.echo("Aborted. Re-run with --force to skip the prompt.", err=True)
+            raise typer.Exit(1)
+
+    from selfies_for_a_year.icloud import (
+        authorize, screen_derivatives, download_many, CACHE_DIR,
+    )
+    from selfies_for_a_year.photos import _DEFAULT_LIBRARY
+
+    ok, msg = authorize()
+    if not ok:
+        typer.echo(f"Photos authorization failed: {msg}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"Screening {total} derivatives...")
+    last_pct = [-1]
+    def screen_progress(i, n, _uuid, _ok):
+        pct = (i * 100) // max(n, 1)
+        if pct != last_pct[0] and pct % 10 == 0:
+            last_pct[0] = pct
+            typer.echo(f"  ...{pct}% ({i}/{n})")
+
+    keeper_uuids = set(screen_derivatives(
+        photos,
+        library=_DEFAULT_LIBRARY,
+        width=width,
+        height=height,
+        min_face_fraction=min_face_fraction,
+        progress_cb=screen_progress,
+    ))
+    typer.echo(f"  {len(keeper_uuids)} candidates survived screening.")
+
+    to_download = [p.uuid for p in photos if p.uuid in keeper_uuids and not p.is_materialized]
+    if to_download:
+        typer.echo(f"Downloading {len(to_download)} originals from iCloud to {CACHE_DIR}...")
+        last_pct = [-1]
+        def dl_progress(i, n, _res):
+            pct = (i * 100) // max(n, 1)
+            if pct != last_pct[0] and pct % 5 == 0:
+                last_pct[0] = pct
+                typer.echo(f"  ...{pct}% ({i}/{n})")
+        results = download_many(to_download, CACHE_DIR, progress_cb=dl_progress)
+        successes = sum(1 for r in results.values() if r.path is not None)
+        typer.echo(f"  downloaded {successes}/{len(to_download)}.")
+    else:
+        results = {}
+
+    # Rewrite paths for downloaded photos; drop everything else that's
+    # still not on disk.
+    kept = []
+    for p in photos:
+        if p.is_materialized:
+            kept.append(p)
+            continue
+        r = results.get(p.uuid)
+        if r is not None and r.path is not None:
+            p.path = r.path
+            p.is_materialized = True
+            kept.append(p)
+        else:
+            reason = (
+                "filtered out by derivative screening" if p.uuid not in keeper_uuids
+                else (r.error if r is not None else "no download attempted")
+            )
+            manifest.append((
+                p.date, p.path, "dropped",
+                f"iCloud original not materialized: {reason}",
+            ))
+    return kept
+
+
 def _collect_sources(
     input_dirs: list[Path],
     apple_photos_name: str | None,
@@ -370,6 +494,12 @@ def _collect_sources(
     since: date | None = None,
     until: date | None = None,
     exclude: list[str] | None = None,
+    *,
+    width: int = 1080,
+    height: int = 1080,
+    min_face_fraction: float = 0.0,
+    materialize_threshold: float = 0.50,
+    force: bool = False,
 ) -> tuple[list[Path], list[datetime], list[str], list[_FaceHint], list[_AppleQuality], list[ManifestEntry]]:
     """Collect and merge photo paths from all sources.
 
@@ -426,6 +556,7 @@ def _collect_sources(
             person.person_id,
             year_start=year_range[0] if year_range else None,
             year_end=year_range[1] if year_range else None,
+            include_unmaterialized=True,
         )
 
         # Record dedup losers before they're dropped
@@ -446,6 +577,18 @@ def _collect_sources(
                         ))
 
         photos = deduplicate_by_day(all_photos)
+
+        # If too many originals live in iCloud, offer to screen derivatives
+        # and materialize just the keepers to /tmp.
+        photos = _maybe_materialize_from_icloud(
+            photos,
+            width=width,
+            height=height,
+            min_face_fraction=min_face_fraction,
+            threshold=materialize_threshold,
+            force=force,
+            manifest=manifest,
+        )
         photos_items = [
             (
                 p.path,
@@ -660,6 +803,8 @@ def compile(
     paths, dates, labels, face_hints, apple_quality, manifest_entries = _collect_sources(
         input_dirs, apple_photos, year_range, label, since=since_date, until=until_date,
         exclude=exclude_patterns,
+        width=width, height=height,
+        min_face_fraction=min_face_fraction, force=force,
     )
 
     # Read audio length now so we can fit-to-music after alignment knows

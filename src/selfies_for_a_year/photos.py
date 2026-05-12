@@ -49,6 +49,13 @@ class PhotosImage:
     # unintentional / a mistake. Validated in #19 as a useful blur gate
     # signal; None when Apple hasn't computed attributes for this asset.
     tastefully_blurred: float | None
+    # Asset UUID — needed for derivative lookup and PhotoKit downloads
+    # of iCloud-only originals.
+    uuid: str = ""
+    # False when the original isn't on local disk (lives in iCloud under
+    # Optimize Mac Storage). path still points at the expected location
+    # so a download can write there; callers must check before reading.
+    is_materialized: bool = True
 
 
 def _connect(library: Path) -> sqlite3.Connection:
@@ -169,12 +176,34 @@ def find_person(
     )
 
 
+def derivative_path(library: Path, uuid: str) -> Path | None:
+    """Return the largest local derivative JPEG for this asset, or None.
+
+    Photos caches lower-res previews under resources/derivatives/ even when
+    Optimize Mac Storage has evicted the original. Useful for screening
+    candidates before triggering a full iCloud download.
+    """
+    if not uuid:
+        return None
+    bucket = uuid[0]
+    candidates: list[Path] = []
+    for sub in (bucket, f"masters/{bucket}"):
+        d = library / "resources" / "derivatives" / sub
+        if not d.is_dir():
+            continue
+        candidates.extend(d.glob(f"{uuid}*.jpeg"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_size)
+
+
 def query_photos(
     person_id: int,
     *,
     year_start: date | None = None,
     year_end: date | None = None,
     library: Path = _DEFAULT_LIBRARY,
+    include_unmaterialized: bool = False,
 ) -> list[PhotosImage]:
     """Find all photos of a person, optionally filtered by date range.
 
@@ -199,7 +228,7 @@ def query_photos(
 
         rows = conn.execute(
             f"""
-            SELECT a.ZDIRECTORY, a.ZFILENAME,
+            SELECT a.ZUUID, a.ZDIRECTORY, a.ZFILENAME,
                    a.ZDATECREATED,
                    df.ZQUALITY, df.ZSIZE,
                    a.ZADJUSTMENTSSTATE,
@@ -220,11 +249,12 @@ def query_photos(
         conn.close()
 
     results = []
-    for (directory, filename, created_ts, quality, size,
+    for (uuid, directory, filename, created_ts, quality, size,
          adj_state, cx, cy, tastefully_blurred) in rows:
         has_adjustments = adj_state == 2
         path = _resolve_path(library, directory, filename, has_adjustments=has_adjustments)
-        if not path.exists():
+        materialized = path.exists()
+        if not materialized and not include_unmaterialized:
             continue
         dt = datetime.fromtimestamp(created_ts + _CORE_DATA_EPOCH_OFFSET)
         results.append(PhotosImage(
@@ -237,6 +267,8 @@ def query_photos(
             # bottom-left, y points up). Flip to top-down image coords.
             face_center_y=(1.0 - cy) if cy is not None else 0.5,
             tastefully_blurred=tastefully_blurred,
+            uuid=uuid,
+            is_materialized=materialized,
         ))
 
     return results
