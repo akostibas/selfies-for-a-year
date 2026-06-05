@@ -19,7 +19,7 @@ When choosing thresholds or behavior in the face-detection / alignment pipeline,
 ## Project
 
 - Python CLI tool using uv, targeting Python 3.14
-- mediapipe FaceLandmarker for face detection (model file downloaded separately, not committed)
+- mediapipe FaceLandmarker for face detection
 - ffmpeg via subprocess for video encoding
 - Frames streamed to ffmpeg stdin (no temp files)
 
@@ -54,23 +54,16 @@ After identification, **group by issue type** (wrong person / cut off / too smal
 
 ## GitHub issues are the session-crossing memory
 
-Sessions reset. Anything we learn while investigating a bug — diagnostics output,
-proven hypotheses, disproved hypotheses, root-cause identifications, proposed
-fixes — **must land in the relevant GitHub issue**, not just the conversation.
-Otherwise the next session re-does the work from scratch.
+General rule (persist findings durably, cite inputs by stable path) lives in
+`~/.claude/agent-development.md`. The concrete venue here is GitHub Issues, and
+the project-specific deltas are:
 
-Rules:
-
-- **Post findings as we confirm them**, not at the end. If a probe narrows the
-  cause, comment on the issue immediately with what was ruled in/out and the
-  numbers that proved it.
 - **Every class of mistake gets an issue.** When we discover a new failure mode
   (wrong person / cut off / upside-down / too small / blurry / etc.), either
   file a new issue for that class or append a case to the existing class issue.
   Don't fix silently.
-- **Reference source photos by absolute on-disk path** (e.g.
-  `~/Pictures/Photos Library.photoslibrary/originals/E/EA71...heic`),
-  not just a date. The path lets the next session re-open the exact file.
+- **Source photo paths look like** `~/Pictures/Photos Library.photoslibrary/originals/E/EA71...heic` —
+  the Apple Photos originals tree, so the next session can re-open the exact file.
 - **Never paste photos into GitHub issues.** This repo is public — issue
   comments are public too. Point at the local path instead. Text, numbers,
   and annotated diagnostic output (verdicts, distances, yaws, EXIF values)
