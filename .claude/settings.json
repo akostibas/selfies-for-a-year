@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ffmpeg *)",
+      "Bash(ffprobe *)",
+      "Bash(gh issue:*)",
+      "Bash(git:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(sqlite3 -readonly *)",
+      "Bash(uv:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/bin/dependabot-status\""
+          }
+        ]
+      }
+    ]
+  }
+}
