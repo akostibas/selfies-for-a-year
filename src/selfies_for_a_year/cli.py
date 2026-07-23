@@ -153,11 +153,55 @@ def _overlay_label(img: Image.Image, label: str) -> Image.Image:
 
 
 _TIER_COLORS = {
-    "slow": (90, 170, 255),       # blue
-    "normal": (220, 220, 220),    # near-white
+    # Energy ramp green→yellow→red for the active tiers; gray for ambient
+    # (neutral, "nothing notable happening").
+    "slow": (90, 200, 110),       # green
+    "normal": (240, 210, 70),     # yellow
     "intense": (255, 95, 95),     # red
-    "ambient": (255, 190, 80),    # amber
+    "ambient": (150, 150, 150),   # gray
 }
+
+
+_DEBUG_FONT_PATHS = (
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/Courier.ttc",
+)
+
+
+def _debug_font(img: Image.Image) -> tuple[ImageFont.ImageFont, int]:
+    """The monospace font + size used by the bottom-left debug block."""
+    font_size = img.width // 44
+    for path in _DEBUG_FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, font_size), font_size
+        except OSError:
+            continue
+    return ImageFont.load_default(size=font_size), font_size
+
+
+def _debug_block_top(img: Image.Image, n_rows: int) -> tuple[int, int, int, int, int]:
+    """Geometry of the debug block: (x0, y0, pad, line_h, font_size).
+
+    Shared by _overlay_debug (which draws the block) and _overlay_metronome
+    (which pins its dot onto the block's first row), so the two never drift.
+    """
+    _, font_size = _debug_font(img)
+    pad = max(5, img.width // 110)
+    line_h = font_size + pad // 2
+    block_h = line_h * n_rows + pad
+    date_top = img.height - img.height // 20 - img.width // 20
+    x0 = pad
+    y0 = date_top - block_h - pad
+    return x0, y0, pad, line_h, font_size
+
+
+def _debug_song_label(song: str, bpm: float | None) -> str:
+    """The song/BPM row text — the metronome dot is pinned to the end of this."""
+    label = song if len(song) <= 30 else song[:29] + "…"
+    if bpm is not None and bpm > 0:
+        label = f"{label}  {bpm:.1f} BPM"
+    return label
 
 
 def _overlay_debug(
@@ -171,34 +215,21 @@ def _overlay_debug(
 ) -> Image.Image:
     """Stack debug lines bottom-left over a black background, monospace.
 
-    Tier line uses a color per tier; filename stays white.
+    Tier line uses a color per tier; filename stays white. The song/BPM row
+    reserves trailing space for the metronome dot (drawn per-frame by
+    _overlay_metronome), so this block and that dot form one HUD.
     """
     if tier is None and filename is None and song is None:
         return img
     img = img.copy()
     draw = ImageDraw.Draw(img)
 
-    font_size = img.width // 44
-    font = None
-    for path in (
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/Courier.ttc",
-    ):
-        try:
-            font = ImageFont.truetype(path, font_size)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default(size=font_size)
+    font, font_size = _debug_font(img)
 
     rows: list[tuple[str, tuple[int, int, int]]] = []
     if song is not None:
-        label = song if len(song) <= 30 else song[:29] + "…"
-        if bpm is not None and bpm > 0:
-            label = f"{label}  {bpm:.1f} BPM"
-        rows.append((label, (200, 200, 255)))
+        # Trailing spaces reserve room for the metronome dot at the row's end.
+        rows.append((_debug_song_label(song, bpm) + "  ", (200, 200, 255)))
     if tier is not None and duration is not None:
         rate = 1.0 / duration if duration > 0 else 0.0
         text = f"{tier.upper():<8}{rate:>5.2f}/s  {duration * 1000:>4.0f}ms"
@@ -208,20 +239,149 @@ def _overlay_debug(
             filename = filename[:30] + "…" + filename[-8:]
         rows.append((filename, (255, 255, 255)))
 
-    pad = max(5, img.width // 110)
-    line_h = font_size + pad // 2
+    x0, y0, pad, line_h, _ = _debug_block_top(img, len(rows))
     block_h = line_h * len(rows) + pad
     widest = max(int(draw.textlength(t, font=font)) for t, _ in rows)
     block_w = widest + pad * 2
-    date_top = img.height - img.height // 20 - img.width // 20
-    x0 = pad
-    y0 = date_top - block_h - pad
     draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=(0, 0, 0, 255))
     text_x = x0 + pad
     text_y = y0 + pad // 2
     for text, color in rows:
         draw.text((text_x, text_y), text, fill=color, font=font, anchor="lt")
         text_y += line_h
+    return img
+
+
+def _overlay_progression_bar(
+    img: Image.Image,
+    states: list[tuple[float, float, str]],
+    t: float,
+    total_duration: float,
+) -> Image.Image:
+    """Draw a horizontal track-progression bar with a playhead across the top.
+
+    ``states`` is a list of (start, end, tier) runs — the song's "sheet music."
+    Each run is a colored segment (reusing ``_TIER_COLORS``); a white playhead
+    marks the current time ``t``. Gives an at-a-glance read of where we are in
+    the track and what pacing state we're in, alongside the textual tier
+    overlay. Drawn per-frame, so kept cheap (a handful of rectangles + a line).
+    """
+    if total_duration <= 0 or not states:
+        return img
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    margin = img.width // 20
+    x0 = margin
+    x1 = img.width - margin
+    span = x1 - x0
+    bar_h = max(6, img.height // 90)
+    y0 = max(6, img.height // 40)
+    y1 = y0 + bar_h
+
+    def x_at(sec: float) -> float:
+        return x0 + span * max(0.0, min(1.0, sec / total_duration))
+
+    # Track background so tiers read against any photo.
+    draw.rectangle((x0 - 2, y0 - 2, x1 + 2, y1 + 2), fill=(0, 0, 0, 140))
+    for start, end, tier in states:
+        sx = x_at(start)
+        ex = x_at(end)
+        color = _TIER_COLORS.get(tier, (200, 200, 200))
+        draw.rectangle((sx, y0, ex, y1), fill=(*color, 255))
+
+    # Playhead: a white line spilling a little above and below the bar.
+    px = x_at(t)
+    over = bar_h
+    draw.line((px, y0 - over, px, y1 + over), fill=(255, 255, 255, 255), width=max(2, img.width // 640))
+
+    # Current tier label just below the playhead, clamped into frame.
+    cur = next((tr for a, b, tr in states if a - 1e-6 <= t <= b + 1e-6 for tr in [tr]), None)
+    if cur is not None:
+        font_size = img.width // 55
+        font = None
+        for path in ("/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf"):
+            try:
+                font = ImageFont.truetype(path, font_size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default(size=font_size)
+        text = cur.upper()
+        tw = draw.textlength(text, font=font)
+        tx = min(max(px - tw / 2, x0), x1 - tw)
+        ty = y1 + over + 2
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 200), font=font, anchor="lt")
+        draw.text((tx, ty), text, fill=_TIER_COLORS.get(cur, (255, 255, 255)), font=font, anchor="lt")
+
+    return img
+
+
+def _metronome_dot_anchor(
+    img: Image.Image,
+    *,
+    song: str | None,
+    bpm: float | None,
+    debug_tier_overlay: bool,
+    debug_filename_overlay: bool,
+) -> tuple[tuple[float, float], ImageFont.ImageFont, str]:
+    """Fixed screen position for the metronome dot, computed once per render.
+
+    When the debug block has a song/BPM row, the dot rides at the end of that
+    row (one HUD, one place to look). Otherwise it falls back to the
+    bottom-right corner so --debug-metronome still works on its own.
+    Returns ((x, y), font, anchor).
+    """
+    song_row = debug_tier_overlay and song is not None
+    if song_row:
+        font, font_size = _debug_font(img)
+        n_rows = 2 + (1 if debug_filename_overlay else 0)  # song + tier (+ filename)
+        x0, y0, pad, line_h, _ = _debug_block_top(img, n_rows)
+        label = _debug_song_label(song, bpm)
+        label_w = ImageDraw.Draw(img).textlength(label, font=font)
+        x = x0 + pad + label_w + font_size * 0.5
+        y = y0 + pad // 2 + font_size / 2  # vertical center of the first row
+        return (x, y), font, "lm"
+    # Fallback: standalone bottom-right.
+    font, _ = _debug_font(img)
+    return (img.width - img.width // 40, img.height - img.height // 20), font, "rs"
+
+
+def _overlay_metronome(
+    img: Image.Image,
+    beat_times: list[float],
+    t: float,
+    *,
+    bpm: float | None,
+    anchor_xy: tuple[float, float],
+    font: ImageFont.ImageFont,
+    anchor: str,
+) -> Image.Image:
+    """Draw a metronome dot that flashes on each beat at a precomputed anchor.
+
+    Filled ● in a short flash window right after the most recent beat, hollow ○
+    the rest of the time — an at-a-glance tempo pulse. Because it blinks on the
+    detected beats (not the cut grid), you can eyeball whether hard cuts land
+    on the beat: in intense sections you'll see several cuts per flash, in
+    slow/ambient sections one flash spans several held photos.
+    """
+    if not beat_times:
+        return img
+    # Most recent beat at or before t (beat_times is sorted ascending).
+    import bisect
+
+    i = bisect.bisect_right(beat_times, t) - 1
+    since = (t - beat_times[i]) if i >= 0 else 1e9
+    beat_period = (60.0 / bpm) if bpm and bpm > 0 else 0.4
+    on = since < min(0.12, beat_period * 0.4)
+
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+    glyph = "●" if on else "○"
+    color = (255, 95, 95, 255) if on else (150, 150, 150, 230)
+    x, y = anchor_xy
+    draw.text((x, y), glyph, fill=color, font=font, anchor=anchor)
     return img
 
 
@@ -257,23 +417,29 @@ def _no_crossfade(
         yield _overlay_label(img, label)
 
 
-def _beat_crossfade_frames(
+def _beat_frames(
     prepared: list[Image.Image],
     labels: list[str],
     paths: list[Path],
     segments: list,
     *,
     fps: int,
+    crossfade: bool,
     debug_tier_overlay: bool,
     debug_filename_overlay: bool,
     song: str | None = None,
     bpm: float | None = None,
+    progression_states: list[tuple[float, float, str]] | None = None,
+    metronome_beats: list[float] | None = None,
 ) -> tuple[Iterator[Image.Image], int]:
-    """Render beat-sync segments as a continuous crossfade.
+    """Render beat-sync segments as constant-fps frames.
 
-    Each photo reaches peak opacity at its segment's start (the beat) and
-    morphs into the next photo over the segment's duration. The final
-    segment is held at full opacity for its duration.
+    With ``crossfade=True`` each photo peaks at its segment's start (the beat)
+    and morphs into the next over the segment's duration. With
+    ``crossfade=False`` segments are hard cuts — the current photo is held
+    until the next beat, then swapped instantly. Both modes run at constant fps
+    so the per-frame overlays (progression playhead, metronome) can animate;
+    the hard-cut mode is what lets those debug HUDs work without a crossfade.
     """
     decorated: list[Image.Image] = []
     for seg in segments:
@@ -293,6 +459,28 @@ def _beat_crossfade_frames(
     total_duration = sum(seg.duration for seg in segments)
     n_frames = max(1, round(total_duration * fps))
 
+    # The metronome dot rides at a fixed screen position (end of the debug
+    # block's BPM row), so compute its anchor once rather than per frame.
+    metro_anchor = metro_font = metro_align = None
+    if metronome_beats:
+        metro_anchor, metro_font, metro_align = _metronome_dot_anchor(
+            decorated[0],
+            song=song,
+            bpm=bpm,
+            debug_tier_overlay=debug_tier_overlay,
+            debug_filename_overlay=debug_filename_overlay,
+        )
+
+    def _apply_frame_overlays(frame: Image.Image, t: float) -> Image.Image:
+        if progression_states:
+            frame = _overlay_progression_bar(frame, progression_states, t, total_duration)
+        if metronome_beats:
+            frame = _overlay_metronome(
+                frame, metronome_beats, t,
+                bpm=bpm, anchor_xy=metro_anchor, font=metro_font, anchor=metro_align,
+            )
+        return frame
+
     def gen() -> Iterator[Image.Image]:
         seg_i = 0
         seg_start = 0.0
@@ -304,15 +492,16 @@ def _beat_crossfade_frames(
                 seg_start = seg_end
                 seg_i += 1
                 seg_end = seg_start + segments[seg_i].duration
-            if seg_i >= last_i:
-                yield decorated[last_i]
+            if not crossfade or seg_i >= last_i:
+                frame = decorated[seg_i]
             else:
                 alpha = (t - seg_start) / segments[seg_i].duration
                 if alpha < 0.0:
                     alpha = 0.0
                 elif alpha > 1.0:
                     alpha = 1.0
-                yield Image.blend(decorated[seg_i], decorated[seg_i + 1], alpha)
+                frame = Image.blend(decorated[seg_i], decorated[seg_i + 1], alpha)
+            yield _apply_frame_overlays(frame, t)
 
     return gen(), n_frames
 
@@ -714,6 +903,11 @@ def compile(
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
+    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering.")] = False,
+    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering.")] = False,
+    emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
+    emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
+    analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
     min_face_fraction: Annotated[
         float,
         typer.Option(
@@ -781,6 +975,15 @@ def compile(
     if beat_sync and fit_to_music:
         typer.echo("Error: --beat-sync and --fit-to-music are mutually exclusive.", err=True)
         raise typer.Exit(1)
+
+    if (emit_progression or emit_progression_json or analyze_only) and not beat_sync:
+        typer.echo(
+            "Error: --emit-progression / --emit-progression-json / --analyze-only "
+            "require --beat-sync (the progression model is built from the beat timeline).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
 
     # --duration is meaningless under --fit-to-music (the per-photo time is
     # derived from audio length / photo count). Warn loudly if the user
@@ -1000,6 +1203,27 @@ def compile(
         )
         typer.echo(timeline.summary())
 
+        # Track progression model: the linear pacing "sheet music" plus
+        # warn-only sanity metrics. Cheap to build from the timeline; drives
+        # both the --emit-progression* diagnostics and the overlay bar.
+        from selfies_for_a_year.beats import TrackProgression
+
+        progression = TrackProgression.from_timeline(timeline)
+        if emit_progression or analyze_only:
+            typer.echo("")
+            typer.echo(progression.render_text())
+        if emit_progression_json is not None:
+            import json
+
+            emit_progression_json.write_text(json.dumps(progression.to_dict(), indent=2))
+            typer.echo(f"Wrote progression JSON to {emit_progression_json}")
+        if analyze_only:
+            typer.echo("\n(--analyze-only: skipping render)")
+            return
+
+        # States for the overlay bar: (start, end, tier) runs.
+        progression_states = [(s.start, s.end, s.tier) for s in progression.states]
+
         # Validate bounds. Bounds are only enforced in auto mode; if the user
         # set --beat-speed they've explicitly opted out of auto-pick.
         if beat_speed is None and not force:
@@ -1051,20 +1275,30 @@ def compile(
                 )
                 raise typer.Exit(1)
 
-        if beat_crossfade:
-            frames_iter, n_out = _beat_crossfade_frames(
+        # The progression playhead and metronome need a per-frame clock, so
+        # any render using them must go through the constant-fps generator —
+        # even hard-cut mode, which otherwise holds one frame per segment.
+        per_frame_overlays = debug_progression_overlay or debug_metronome
+        metronome_beats = timeline.beat_times if debug_metronome else None
+
+        if beat_crossfade or per_frame_overlays:
+            frames_iter, n_out = _beat_frames(
                 prepared,
                 kept_labels,
                 kept_paths,
                 timeline.segments,
                 fps=FPS,
+                crossfade=beat_crossfade,
                 debug_tier_overlay=debug_tier_overlay,
                 debug_filename_overlay=debug_filename_overlay,
                 song=music.stem,
                 bpm=timeline.bpm,
+                progression_states=progression_states if debug_progression_overlay else None,
+                metronome_beats=metronome_beats,
             )
+            mode = "continuous crossfade" if beat_crossfade else "constant-fps hard cut"
             typer.echo(
-                f"Encoding {len(timeline.segments)} segment(s) as continuous crossfade "
+                f"Encoding {len(timeline.segments)} segment(s) as {mode} "
                 f"({n_out} frames at {FPS}fps, {n_out / FPS:.1f}s) ..."
             )
             compile_video(
@@ -1077,7 +1311,8 @@ def compile(
             )
             rendered_count = n_out
         else:
-            # Render each segment's photo with its label, no crossfade.
+            # Production hard cuts: one held frame per segment, variable
+            # duration. Efficient (no per-frame work) but no animated overlays.
             rendered: list[Image.Image] = []
             seg_durations: list[float] = []
             for seg in timeline.segments:
