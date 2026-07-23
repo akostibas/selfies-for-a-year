@@ -225,6 +225,72 @@ def _overlay_debug(
     return img
 
 
+def _overlay_progression_bar(
+    img: Image.Image,
+    states: list[tuple[float, float, str]],
+    t: float,
+    total_duration: float,
+) -> Image.Image:
+    """Draw a horizontal track-progression bar with a playhead across the top.
+
+    ``states`` is a list of (start, end, tier) runs — the song's "sheet music."
+    Each run is a colored segment (reusing ``_TIER_COLORS``); a white playhead
+    marks the current time ``t``. Gives an at-a-glance read of where we are in
+    the track and what pacing state we're in, alongside the textual tier
+    overlay. Drawn per-frame, so kept cheap (a handful of rectangles + a line).
+    """
+    if total_duration <= 0 or not states:
+        return img
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    margin = img.width // 20
+    x0 = margin
+    x1 = img.width - margin
+    span = x1 - x0
+    bar_h = max(6, img.height // 90)
+    y0 = max(6, img.height // 40)
+    y1 = y0 + bar_h
+
+    def x_at(sec: float) -> float:
+        return x0 + span * max(0.0, min(1.0, sec / total_duration))
+
+    # Track background so tiers read against any photo.
+    draw.rectangle((x0 - 2, y0 - 2, x1 + 2, y1 + 2), fill=(0, 0, 0, 140))
+    for start, end, tier in states:
+        sx = x_at(start)
+        ex = x_at(end)
+        color = _TIER_COLORS.get(tier, (200, 200, 200))
+        draw.rectangle((sx, y0, ex, y1), fill=(*color, 255))
+
+    # Playhead: a white line spilling a little above and below the bar.
+    px = x_at(t)
+    over = bar_h
+    draw.line((px, y0 - over, px, y1 + over), fill=(255, 255, 255, 255), width=max(2, img.width // 640))
+
+    # Current tier label just below the playhead, clamped into frame.
+    cur = next((tr for a, b, tr in states if a - 1e-6 <= t <= b + 1e-6 for tr in [tr]), None)
+    if cur is not None:
+        font_size = img.width // 55
+        font = None
+        for path in ("/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf"):
+            try:
+                font = ImageFont.truetype(path, font_size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default(size=font_size)
+        text = cur.upper()
+        tw = draw.textlength(text, font=font)
+        tx = min(max(px - tw / 2, x0), x1 - tw)
+        ty = y1 + over + 2
+        draw.text((tx + 1, ty + 1), text, fill=(0, 0, 0, 200), font=font, anchor="lt")
+        draw.text((tx, ty), text, fill=_TIER_COLORS.get(cur, (255, 255, 255)), font=font, anchor="lt")
+
+    return img
+
+
 def _crossfade(
     frames: Iterator[tuple[Image.Image, str]],
     hold_frames: int,
@@ -268,6 +334,7 @@ def _beat_crossfade_frames(
     debug_filename_overlay: bool,
     song: str | None = None,
     bpm: float | None = None,
+    progression_states: list[tuple[float, float, str]] | None = None,
 ) -> tuple[Iterator[Image.Image], int]:
     """Render beat-sync segments as a continuous crossfade.
 
@@ -305,14 +372,19 @@ def _beat_crossfade_frames(
                 seg_i += 1
                 seg_end = seg_start + segments[seg_i].duration
             if seg_i >= last_i:
-                yield decorated[last_i]
+                frame = decorated[last_i]
             else:
                 alpha = (t - seg_start) / segments[seg_i].duration
                 if alpha < 0.0:
                     alpha = 0.0
                 elif alpha > 1.0:
                     alpha = 1.0
-                yield Image.blend(decorated[seg_i], decorated[seg_i + 1], alpha)
+                frame = Image.blend(decorated[seg_i], decorated[seg_i + 1], alpha)
+            if progression_states:
+                frame = _overlay_progression_bar(
+                    frame, progression_states, t, total_duration
+                )
+            yield frame
 
     return gen(), n_frames
 
@@ -714,6 +786,10 @@ def compile(
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
+    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-crossfade] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Crossfade path only.")] = False,
+    emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
+    emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
+    analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
     min_face_fraction: Annotated[
         float,
         typer.Option(
@@ -781,6 +857,21 @@ def compile(
     if beat_sync and fit_to_music:
         typer.echo("Error: --beat-sync and --fit-to-music are mutually exclusive.", err=True)
         raise typer.Exit(1)
+
+    if (emit_progression or emit_progression_json or analyze_only) and not beat_sync:
+        typer.echo(
+            "Error: --emit-progression / --emit-progression-json / --analyze-only "
+            "require --beat-sync (the progression model is built from the beat timeline).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if debug_progression_overlay and not beat_crossfade:
+        typer.echo(
+            "Warning: --debug-progression-overlay only draws on the --beat-crossfade "
+            "path (it needs a per-frame clock); it will be ignored otherwise.",
+            err=True,
+        )
 
     # --duration is meaningless under --fit-to-music (the per-photo time is
     # derived from audio length / photo count). Warn loudly if the user
@@ -1000,6 +1091,27 @@ def compile(
         )
         typer.echo(timeline.summary())
 
+        # Track progression model: the linear pacing "sheet music" plus
+        # warn-only sanity metrics. Cheap to build from the timeline; drives
+        # both the --emit-progression* diagnostics and the overlay bar.
+        from selfies_for_a_year.beats import TrackProgression
+
+        progression = TrackProgression.from_timeline(timeline)
+        if emit_progression or analyze_only:
+            typer.echo("")
+            typer.echo(progression.render_text())
+        if emit_progression_json is not None:
+            import json
+
+            emit_progression_json.write_text(json.dumps(progression.to_dict(), indent=2))
+            typer.echo(f"Wrote progression JSON to {emit_progression_json}")
+        if analyze_only:
+            typer.echo("\n(--analyze-only: skipping render)")
+            return
+
+        # States for the overlay bar: (start, end, tier) runs.
+        progression_states = [(s.start, s.end, s.tier) for s in progression.states]
+
         # Validate bounds. Bounds are only enforced in auto mode; if the user
         # set --beat-speed they've explicitly opted out of auto-pick.
         if beat_speed is None and not force:
@@ -1062,6 +1174,7 @@ def compile(
                 debug_filename_overlay=debug_filename_overlay,
                 song=music.stem,
                 bpm=timeline.bpm,
+                progression_states=progression_states if debug_progression_overlay else None,
             )
             typer.echo(
                 f"Encoding {len(timeline.segments)} segment(s) as continuous crossfade "

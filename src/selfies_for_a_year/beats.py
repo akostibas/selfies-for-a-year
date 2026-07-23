@@ -208,6 +208,205 @@ def _subdivision_label(s: float) -> str:
     return table.get(s, f"{s}x beat")
 
 
+# --- Track progression model ----------------------------------------------
+#
+# A linear, time-indexed "sheet music" for a track: the sequence of pacing
+# states (ambient/slow/normal/intense) the song passes through, plus a few
+# sanity metrics that let an agent judge whether the pacing the tool landed on
+# is reasonable *without rendering a video*. Warn-only: metrics never block a
+# render, they just surface ⚠ flags in the text/JSON emit.
+
+# Thresholds for the warn-only sanity flags. Declarative and tunable — a bad
+# pacing param should make one of these fire in the text emit before you burn
+# a render. See CLAUDE.md "favor false negatives": these lean toward flagging.
+PEAK_PPS_WARN = 5.0        # photos/sec in the worst 1s window above this reads as frantic
+SHORTEST_HOLD_WARN = 0.10  # a photo held under this (100ms) flickers rather than registers
+MIN_STATE_RUN_WARN = 3.0   # mean tier-run shorter than this = choppy, indecisive tiering
+
+
+def _label_to_tier(label: str) -> str:
+    """Collapse a pacing-interval label ('intense (×2)', 'ambient (no clear
+    beat)') to its base tier for the progression model."""
+    if label.startswith("intense"):
+        return "intense"
+    if label.startswith("slow"):
+        return "slow"
+    if label.startswith("normal"):
+        return "normal"
+    return "ambient"
+
+
+@dataclass
+class ProgressionState:
+    """One contiguous stretch of the song in a single pacing tier."""
+    start: float
+    end: float
+    tier: str  # "slow" | "normal" | "intense" | "ambient"
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+@dataclass
+class TrackProgression:
+    """Linear progression of pacing states over a track, with sanity metrics.
+
+    Built from a :class:`BeatTimeline`. ``states`` is the "sheet music"; the
+    metrics below summarize both the tier structure (how the song is carved up)
+    and the photo cadence (how fast frames actually change), so pacing can be
+    judged from text alone.
+    """
+    states: list[ProgressionState]
+    total_duration: float
+    bpm: float
+    # tier-structure metrics
+    transition_count: int          # number of tier changes (len(states) - 1)
+    mean_state_run: float          # average state duration, seconds
+    shortest_run: float            # shortest state duration, seconds
+    time_fraction: dict[str, float]  # tier -> fraction of total_duration
+    # photo-cadence metrics (the "2-3 per second is unreasonable" concern)
+    photos_per_sec_mean: float
+    photos_per_sec_peak: float     # max transitions in any 1s window
+    shortest_hold: float           # shortest single-photo hold, seconds
+    warnings: list[str]
+
+    @classmethod
+    def from_timeline(cls, timeline: "BeatTimeline") -> "TrackProgression":
+        # States: reuse the same priority-ranked interval computation the
+        # printed pacing timeline uses, collapsed to base tiers and merged
+        # across any same-tier neighbors.
+        intervals = timeline._pacing_intervals()
+        states: list[ProgressionState] = []
+        for start, end, label in intervals:
+            tier = _label_to_tier(label)
+            if states and states[-1].tier == tier:
+                states[-1].end = end
+            else:
+                states.append(ProgressionState(start, end, tier))
+
+        total = timeline.total_duration
+        runs = [s.duration for s in states]
+        transition_count = max(0, len(states) - 1)
+        mean_state_run = (sum(runs) / len(runs)) if runs else 0.0
+        shortest_run = min(runs) if runs else 0.0
+
+        time_fraction: dict[str, float] = {}
+        if total > 0:
+            for s in states:
+                time_fraction[s.tier] = time_fraction.get(s.tier, 0.0) + s.duration / total
+
+        # Photo cadence from the actual segment durations.
+        durations = [seg.duration for seg in timeline.segments]
+        seg_starts: list[float] = []
+        acc = 0.0
+        for d in durations:
+            seg_starts.append(acc)
+            acc += d
+        shortest_hold = min(durations) if durations else 0.0
+        photos_per_sec_mean = (len(durations) / total) if total > 0 else 0.0
+        # Peak: slide a 1s window across the segment-start times and take the
+        # densest count. Starts are sorted, so a two-pointer sweep suffices.
+        peak = 0
+        j = 0
+        for i, st in enumerate(seg_starts):
+            while seg_starts[i] - seg_starts[j] > 1.0:
+                j += 1
+            peak = max(peak, i - j + 1)
+        photos_per_sec_peak = float(peak)
+
+        warnings: list[str] = []
+        if photos_per_sec_peak > PEAK_PPS_WARN:
+            warnings.append(
+                f"peak cadence {photos_per_sec_peak:.0f}/s in the busiest 1s window "
+                f"(> {PEAK_PPS_WARN:.0f}/s tends to read as frantic)"
+            )
+        if durations and shortest_hold < SHORTEST_HOLD_WARN:
+            warnings.append(
+                f"shortest photo hold {shortest_hold * 1000:.0f}ms "
+                f"(< {SHORTEST_HOLD_WARN * 1000:.0f}ms flickers rather than registers)"
+            )
+        if len(states) > 1 and mean_state_run < MIN_STATE_RUN_WARN:
+            warnings.append(
+                f"{transition_count} tier changes, mean run {mean_state_run:.1f}s "
+                f"(< {MIN_STATE_RUN_WARN:.0f}s = choppy, indecisive tiering)"
+            )
+
+        return cls(
+            states=states,
+            total_duration=total,
+            bpm=timeline.bpm,
+            transition_count=transition_count,
+            mean_state_run=mean_state_run,
+            shortest_run=shortest_run,
+            time_fraction=time_fraction,
+            photos_per_sec_mean=photos_per_sec_mean,
+            photos_per_sec_peak=photos_per_sec_peak,
+            shortest_hold=shortest_hold,
+            warnings=warnings,
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "total_duration": round(self.total_duration, 3),
+            "bpm": round(self.bpm, 2),
+            "states": [
+                {
+                    "start": round(s.start, 3),
+                    "end": round(s.end, 3),
+                    "duration": round(s.duration, 3),
+                    "tier": s.tier,
+                }
+                for s in self.states
+            ],
+            "metrics": {
+                "transition_count": self.transition_count,
+                "mean_state_run": round(self.mean_state_run, 3),
+                "shortest_run": round(self.shortest_run, 3),
+                "photos_per_sec_mean": round(self.photos_per_sec_mean, 3),
+                "photos_per_sec_peak": round(self.photos_per_sec_peak, 3),
+                "shortest_hold": round(self.shortest_hold, 3),
+                "time_fraction": {k: round(v, 3) for k, v in self.time_fraction.items()},
+            },
+            "warnings": list(self.warnings),
+        }
+
+    def render_text(self) -> str:
+        def fmt(t: float) -> str:
+            m, s = divmod(int(t), 60)
+            return f"{m}:{s:02d}"
+
+        lines = [
+            f"Track progression ({fmt(self.total_duration)}, {self.bpm:.1f} BPM):",
+        ]
+        for s in self.states:
+            bar_frac = s.duration / self.total_duration if self.total_duration else 0.0
+            bar = "█" * max(1, round(bar_frac * 40))
+            lines.append(
+                f"  {fmt(s.start):>4}–{fmt(s.end):<4} {s.tier:<8} "
+                f"{s.duration:5.1f}s {bar}"
+            )
+        frac = ", ".join(
+            f"{k} {v * 100:.0f}%"
+            for k, v in sorted(self.time_fraction.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(
+            f"  Metrics: {self.transition_count} tier changes, "
+            f"mean run {self.mean_state_run:.1f}s, shortest {self.shortest_run:.1f}s"
+        )
+        lines.append(
+            f"           cadence {self.photos_per_sec_mean:.2f}/s avg, "
+            f"{self.photos_per_sec_peak:.0f}/s peak, "
+            f"shortest hold {self.shortest_hold * 1000:.0f}ms"
+        )
+        lines.append(f"           time in tier: {frac}")
+        for w in self.warnings:
+            lines.append(f"  ⚠ {w}")
+        if not self.warnings:
+            lines.append("  ✓ no pacing sanity flags")
+        return "\n".join(lines)
+
+
 def _detect_beats(
     audio_path: Path,
     *,
