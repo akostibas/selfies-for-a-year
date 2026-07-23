@@ -153,11 +153,55 @@ def _overlay_label(img: Image.Image, label: str) -> Image.Image:
 
 
 _TIER_COLORS = {
-    "slow": (90, 170, 255),       # blue
-    "normal": (220, 220, 220),    # near-white
+    # Energy ramp green→yellow→red for the active tiers; gray for ambient
+    # (neutral, "nothing notable happening").
+    "slow": (90, 200, 110),       # green
+    "normal": (240, 210, 70),     # yellow
     "intense": (255, 95, 95),     # red
-    "ambient": (255, 190, 80),    # amber
+    "ambient": (150, 150, 150),   # gray
 }
+
+
+_DEBUG_FONT_PATHS = (
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Monaco.ttf",
+    "/System/Library/Fonts/Courier.ttc",
+)
+
+
+def _debug_font(img: Image.Image) -> tuple[ImageFont.ImageFont, int]:
+    """The monospace font + size used by the bottom-left debug block."""
+    font_size = img.width // 44
+    for path in _DEBUG_FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, font_size), font_size
+        except OSError:
+            continue
+    return ImageFont.load_default(size=font_size), font_size
+
+
+def _debug_block_top(img: Image.Image, n_rows: int) -> tuple[int, int, int, int, int]:
+    """Geometry of the debug block: (x0, y0, pad, line_h, font_size).
+
+    Shared by _overlay_debug (which draws the block) and _overlay_metronome
+    (which pins its dot onto the block's first row), so the two never drift.
+    """
+    _, font_size = _debug_font(img)
+    pad = max(5, img.width // 110)
+    line_h = font_size + pad // 2
+    block_h = line_h * n_rows + pad
+    date_top = img.height - img.height // 20 - img.width // 20
+    x0 = pad
+    y0 = date_top - block_h - pad
+    return x0, y0, pad, line_h, font_size
+
+
+def _debug_song_label(song: str, bpm: float | None) -> str:
+    """The song/BPM row text — the metronome dot is pinned to the end of this."""
+    label = song if len(song) <= 30 else song[:29] + "…"
+    if bpm is not None and bpm > 0:
+        label = f"{label}  {bpm:.1f} BPM"
+    return label
 
 
 def _overlay_debug(
@@ -171,34 +215,21 @@ def _overlay_debug(
 ) -> Image.Image:
     """Stack debug lines bottom-left over a black background, monospace.
 
-    Tier line uses a color per tier; filename stays white.
+    Tier line uses a color per tier; filename stays white. The song/BPM row
+    reserves trailing space for the metronome dot (drawn per-frame by
+    _overlay_metronome), so this block and that dot form one HUD.
     """
     if tier is None and filename is None and song is None:
         return img
     img = img.copy()
     draw = ImageDraw.Draw(img)
 
-    font_size = img.width // 44
-    font = None
-    for path in (
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/Courier.ttc",
-    ):
-        try:
-            font = ImageFont.truetype(path, font_size)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default(size=font_size)
+    font, font_size = _debug_font(img)
 
     rows: list[tuple[str, tuple[int, int, int]]] = []
     if song is not None:
-        label = song if len(song) <= 30 else song[:29] + "…"
-        if bpm is not None and bpm > 0:
-            label = f"{label}  {bpm:.1f} BPM"
-        rows.append((label, (200, 200, 255)))
+        # Trailing spaces reserve room for the metronome dot at the row's end.
+        rows.append((_debug_song_label(song, bpm) + "  ", (200, 200, 255)))
     if tier is not None and duration is not None:
         rate = 1.0 / duration if duration > 0 else 0.0
         text = f"{tier.upper():<8}{rate:>5.2f}/s  {duration * 1000:>4.0f}ms"
@@ -208,14 +239,10 @@ def _overlay_debug(
             filename = filename[:30] + "…" + filename[-8:]
         rows.append((filename, (255, 255, 255)))
 
-    pad = max(5, img.width // 110)
-    line_h = font_size + pad // 2
+    x0, y0, pad, line_h, _ = _debug_block_top(img, len(rows))
     block_h = line_h * len(rows) + pad
     widest = max(int(draw.textlength(t, font=font)) for t, _ in rows)
     block_w = widest + pad * 2
-    date_top = img.height - img.height // 20 - img.width // 20
-    x0 = pad
-    y0 = date_top - block_h - pad
     draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=(0, 0, 0, 255))
     text_x = x0 + pad
     text_y = y0 + pad // 2
@@ -291,13 +318,47 @@ def _overlay_progression_bar(
     return img
 
 
+def _metronome_dot_anchor(
+    img: Image.Image,
+    *,
+    song: str | None,
+    bpm: float | None,
+    debug_tier_overlay: bool,
+    debug_filename_overlay: bool,
+) -> tuple[tuple[float, float], ImageFont.ImageFont, str]:
+    """Fixed screen position for the metronome dot, computed once per render.
+
+    When the debug block has a song/BPM row, the dot rides at the end of that
+    row (one HUD, one place to look). Otherwise it falls back to the
+    bottom-right corner so --debug-metronome still works on its own.
+    Returns ((x, y), font, anchor).
+    """
+    song_row = debug_tier_overlay and song is not None
+    if song_row:
+        font, font_size = _debug_font(img)
+        n_rows = 2 + (1 if debug_filename_overlay else 0)  # song + tier (+ filename)
+        x0, y0, pad, line_h, _ = _debug_block_top(img, n_rows)
+        label = _debug_song_label(song, bpm)
+        label_w = ImageDraw.Draw(img).textlength(label, font=font)
+        x = x0 + pad + label_w + font_size * 0.5
+        y = y0 + pad // 2 + font_size / 2  # vertical center of the first row
+        return (x, y), font, "lm"
+    # Fallback: standalone bottom-right.
+    font, _ = _debug_font(img)
+    return (img.width - img.width // 40, img.height - img.height // 20), font, "rs"
+
+
 def _overlay_metronome(
     img: Image.Image,
     beat_times: list[float],
     t: float,
-    bpm: float | None = None,
+    *,
+    bpm: float | None,
+    anchor_xy: tuple[float, float],
+    font: ImageFont.ImageFont,
+    anchor: str,
 ) -> Image.Image:
-    """Draw a metronome dot that flashes on each beat, bottom-left.
+    """Draw a metronome dot that flashes on each beat at a precomputed anchor.
 
     Filled ● in a short flash window right after the most recent beat, hollow ○
     the rest of the time — an at-a-glance tempo pulse. Because it blinks on the
@@ -307,38 +368,20 @@ def _overlay_metronome(
     """
     if not beat_times:
         return img
-    img = img.copy()
-    draw = ImageDraw.Draw(img, "RGBA")
-
     # Most recent beat at or before t (beat_times is sorted ascending).
     import bisect
 
     i = bisect.bisect_right(beat_times, t) - 1
     since = (t - beat_times[i]) if i >= 0 else 1e9
     beat_period = (60.0 / bpm) if bpm and bpm > 0 else 0.4
-    flash_window = min(0.12, beat_period * 0.4)
-    on = since < flash_window
+    on = since < min(0.12, beat_period * 0.4)
 
-    font_size = img.width // 22
-    font = None
-    for path in ("/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf"):
-        try:
-            font = ImageFont.truetype(path, font_size)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default(size=font_size)
-
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
     glyph = "●" if on else "○"
     color = (255, 95, 95, 255) if on else (150, 150, 150, 230)
-    margin = img.width // 40
-    # Bottom-right corner: clear of the bottom-left debug block and the
-    # centered date label.
-    x = img.width - margin
-    y = img.height - img.height // 20
-    draw.text((x + 1, y + 1), glyph, fill=(0, 0, 0, 200), font=font, anchor="rs")
-    draw.text((x, y), glyph, fill=color, font=font, anchor="rs")
+    x, y = anchor_xy
+    draw.text((x, y), glyph, fill=color, font=font, anchor=anchor)
     return img
 
 
@@ -416,11 +459,26 @@ def _beat_frames(
     total_duration = sum(seg.duration for seg in segments)
     n_frames = max(1, round(total_duration * fps))
 
+    # The metronome dot rides at a fixed screen position (end of the debug
+    # block's BPM row), so compute its anchor once rather than per frame.
+    metro_anchor = metro_font = metro_align = None
+    if metronome_beats:
+        metro_anchor, metro_font, metro_align = _metronome_dot_anchor(
+            decorated[0],
+            song=song,
+            bpm=bpm,
+            debug_tier_overlay=debug_tier_overlay,
+            debug_filename_overlay=debug_filename_overlay,
+        )
+
     def _apply_frame_overlays(frame: Image.Image, t: float) -> Image.Image:
         if progression_states:
             frame = _overlay_progression_bar(frame, progression_states, t, total_duration)
         if metronome_beats:
-            frame = _overlay_metronome(frame, metronome_beats, t, bpm)
+            frame = _overlay_metronome(
+                frame, metronome_beats, t,
+                bpm=bpm, anchor_xy=metro_anchor, font=metro_font, anchor=metro_align,
+            )
         return frame
 
     def gen() -> Iterator[Image.Image]:
