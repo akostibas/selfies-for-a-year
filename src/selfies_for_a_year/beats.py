@@ -41,6 +41,7 @@ class BeatTimeline:
     slow_regions: list[tuple[float, float]] = field(default_factory=list)
     intense_multiplier: float = 1.0
     slow_multiplier: float = 1.0
+    beat_times: list[float] = field(default_factory=list)  # detected beat onsets, seconds
 
     def _pacing_intervals(self) -> list[tuple[float, float, str]]:
         return _pacing_intervals_impl(
@@ -1204,6 +1205,7 @@ def build_timeline(
             photos_dropped=0,
             photos_held_short=0,
             selection_per_month=[],
+            beat_times=[float(t) for t in beat_times],
         )
 
     # Ensure the timeline starts at audio time 0. If the first beat-emission
@@ -1308,4 +1310,5 @@ def build_timeline(
         slow_regions=slow_regions,
         intense_multiplier=eff_intense_mult,
         slow_multiplier=eff_slow_mult,
+        beat_times=[float(t) for t in beat_times],
     )

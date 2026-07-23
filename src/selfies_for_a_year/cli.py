@@ -291,6 +291,57 @@ def _overlay_progression_bar(
     return img
 
 
+def _overlay_metronome(
+    img: Image.Image,
+    beat_times: list[float],
+    t: float,
+    bpm: float | None = None,
+) -> Image.Image:
+    """Draw a metronome dot that flashes on each beat, bottom-left.
+
+    Filled ● in a short flash window right after the most recent beat, hollow ○
+    the rest of the time — an at-a-glance tempo pulse. Because it blinks on the
+    detected beats (not the cut grid), you can eyeball whether hard cuts land
+    on the beat: in intense sections you'll see several cuts per flash, in
+    slow/ambient sections one flash spans several held photos.
+    """
+    if not beat_times:
+        return img
+    img = img.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Most recent beat at or before t (beat_times is sorted ascending).
+    import bisect
+
+    i = bisect.bisect_right(beat_times, t) - 1
+    since = (t - beat_times[i]) if i >= 0 else 1e9
+    beat_period = (60.0 / bpm) if bpm and bpm > 0 else 0.4
+    flash_window = min(0.12, beat_period * 0.4)
+    on = since < flash_window
+
+    font_size = img.width // 22
+    font = None
+    for path in ("/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/Monaco.ttf"):
+        try:
+            font = ImageFont.truetype(path, font_size)
+            break
+        except OSError:
+            continue
+    if font is None:
+        font = ImageFont.load_default(size=font_size)
+
+    glyph = "●" if on else "○"
+    color = (255, 95, 95, 255) if on else (150, 150, 150, 230)
+    margin = img.width // 40
+    # Bottom-right corner: clear of the bottom-left debug block and the
+    # centered date label.
+    x = img.width - margin
+    y = img.height - img.height // 20
+    draw.text((x + 1, y + 1), glyph, fill=(0, 0, 0, 200), font=font, anchor="rs")
+    draw.text((x, y), glyph, fill=color, font=font, anchor="rs")
+    return img
+
+
 def _crossfade(
     frames: Iterator[tuple[Image.Image, str]],
     hold_frames: int,
@@ -323,24 +374,29 @@ def _no_crossfade(
         yield _overlay_label(img, label)
 
 
-def _beat_crossfade_frames(
+def _beat_frames(
     prepared: list[Image.Image],
     labels: list[str],
     paths: list[Path],
     segments: list,
     *,
     fps: int,
+    crossfade: bool,
     debug_tier_overlay: bool,
     debug_filename_overlay: bool,
     song: str | None = None,
     bpm: float | None = None,
     progression_states: list[tuple[float, float, str]] | None = None,
+    metronome_beats: list[float] | None = None,
 ) -> tuple[Iterator[Image.Image], int]:
-    """Render beat-sync segments as a continuous crossfade.
+    """Render beat-sync segments as constant-fps frames.
 
-    Each photo reaches peak opacity at its segment's start (the beat) and
-    morphs into the next photo over the segment's duration. The final
-    segment is held at full opacity for its duration.
+    With ``crossfade=True`` each photo peaks at its segment's start (the beat)
+    and morphs into the next over the segment's duration. With
+    ``crossfade=False`` segments are hard cuts — the current photo is held
+    until the next beat, then swapped instantly. Both modes run at constant fps
+    so the per-frame overlays (progression playhead, metronome) can animate;
+    the hard-cut mode is what lets those debug HUDs work without a crossfade.
     """
     decorated: list[Image.Image] = []
     for seg in segments:
@@ -360,6 +416,13 @@ def _beat_crossfade_frames(
     total_duration = sum(seg.duration for seg in segments)
     n_frames = max(1, round(total_duration * fps))
 
+    def _apply_frame_overlays(frame: Image.Image, t: float) -> Image.Image:
+        if progression_states:
+            frame = _overlay_progression_bar(frame, progression_states, t, total_duration)
+        if metronome_beats:
+            frame = _overlay_metronome(frame, metronome_beats, t, bpm)
+        return frame
+
     def gen() -> Iterator[Image.Image]:
         seg_i = 0
         seg_start = 0.0
@@ -371,8 +434,8 @@ def _beat_crossfade_frames(
                 seg_start = seg_end
                 seg_i += 1
                 seg_end = seg_start + segments[seg_i].duration
-            if seg_i >= last_i:
-                frame = decorated[last_i]
+            if not crossfade or seg_i >= last_i:
+                frame = decorated[seg_i]
             else:
                 alpha = (t - seg_start) / segments[seg_i].duration
                 if alpha < 0.0:
@@ -380,11 +443,7 @@ def _beat_crossfade_frames(
                 elif alpha > 1.0:
                     alpha = 1.0
                 frame = Image.blend(decorated[seg_i], decorated[seg_i + 1], alpha)
-            if progression_states:
-                frame = _overlay_progression_bar(
-                    frame, progression_states, t, total_duration
-                )
-            yield frame
+            yield _apply_frame_overlays(frame, t)
 
     return gen(), n_frames
 
@@ -786,7 +845,8 @@ def compile(
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
-    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-crossfade] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Crossfade path only.")] = False,
+    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering.")] = False,
+    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering.")] = False,
     emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
     emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
     analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
@@ -866,12 +926,6 @@ def compile(
         )
         raise typer.Exit(1)
 
-    if debug_progression_overlay and not beat_crossfade:
-        typer.echo(
-            "Warning: --debug-progression-overlay only draws on the --beat-crossfade "
-            "path (it needs a per-frame clock); it will be ignored otherwise.",
-            err=True,
-        )
 
     # --duration is meaningless under --fit-to-music (the per-photo time is
     # derived from audio length / photo count). Warn loudly if the user
@@ -1163,21 +1217,30 @@ def compile(
                 )
                 raise typer.Exit(1)
 
-        if beat_crossfade:
-            frames_iter, n_out = _beat_crossfade_frames(
+        # The progression playhead and metronome need a per-frame clock, so
+        # any render using them must go through the constant-fps generator —
+        # even hard-cut mode, which otherwise holds one frame per segment.
+        per_frame_overlays = debug_progression_overlay or debug_metronome
+        metronome_beats = timeline.beat_times if debug_metronome else None
+
+        if beat_crossfade or per_frame_overlays:
+            frames_iter, n_out = _beat_frames(
                 prepared,
                 kept_labels,
                 kept_paths,
                 timeline.segments,
                 fps=FPS,
+                crossfade=beat_crossfade,
                 debug_tier_overlay=debug_tier_overlay,
                 debug_filename_overlay=debug_filename_overlay,
                 song=music.stem,
                 bpm=timeline.bpm,
                 progression_states=progression_states if debug_progression_overlay else None,
+                metronome_beats=metronome_beats,
             )
+            mode = "continuous crossfade" if beat_crossfade else "constant-fps hard cut"
             typer.echo(
-                f"Encoding {len(timeline.segments)} segment(s) as continuous crossfade "
+                f"Encoding {len(timeline.segments)} segment(s) as {mode} "
                 f"({n_out} frames at {FPS}fps, {n_out / FPS:.1f}s) ..."
             )
             compile_video(
@@ -1190,7 +1253,8 @@ def compile(
             )
             rendered_count = n_out
         else:
-            # Render each segment's photo with its label, no crossfade.
+            # Production hard cuts: one held frame per segment, variable
+            # duration. Efficient (no per-frame work) but no animated overlays.
             rendered: list[Image.Image] = []
             seg_durations: list[float] = []
             for seg in timeline.segments:
