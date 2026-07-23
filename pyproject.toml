@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "typer>=0.26.8",
+    "click>=8",  # imported directly in cli.py; typer 0.26+ no longer pulls it in
     "Pillow>=12.3.0",
     "rich>=14",
     "mediapipe>=0.10",
