@@ -17,7 +17,6 @@ and report that case clearly.
 """
 from __future__ import annotations
 
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass

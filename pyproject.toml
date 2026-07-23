@@ -22,6 +22,21 @@ dependencies = [
 [project.scripts]
 selfies-for-a-year = "selfies_for_a_year.cli:app"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.31,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["experiments"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]  # long CLI help/error strings are common and fine here

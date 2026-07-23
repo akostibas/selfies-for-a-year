@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ExifTags, ImageOps
+from PIL import ExifTags, Image, ImageOps
 
 try:
     from pillow_heif import register_heif_opener
