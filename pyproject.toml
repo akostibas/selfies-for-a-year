@@ -13,7 +13,7 @@ dependencies = [
     "Pillow>=12.3.0",
     "rich>=14",
     "mediapipe>=0.10",
-    "numpy>=2.5.1",
+    "numpy>=2.4.4,<2.5",  # numba (via librosa) caps numpy<2.5; raise together when numba catches up
     "pillow-heif>=1.4.0",
     "librosa>=0.11.0",
     "pyobjc-framework-photos>=12.2.1",
@@ -22,6 +22,21 @@ dependencies = [
 [project.scripts]
 selfies-for-a-year = "selfies_for_a_year.cli:app"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.31,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["experiments"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]  # long CLI help/error strings are common and fine here

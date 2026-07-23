@@ -118,7 +118,6 @@ class BeatTimeline:
                     if start - 1e-6 <= st < end - 1e-6
                 ]
                 if region_durs:
-                    min_d = min(region_durs)
                     max_d = max(region_durs)
                     min_rate = 1.0 / max_d if max_d > 0 else 0.0
                     extreme = (
@@ -273,7 +272,7 @@ class TrackProgression:
     warnings: list[str]
 
     @classmethod
-    def from_timeline(cls, timeline: "BeatTimeline") -> "TrackProgression":
+    def from_timeline(cls, timeline: BeatTimeline) -> TrackProgression:
         # States: reuse the same priority-ranked interval computation the
         # printed pacing timeline uses, collapsed to base tiers and merged
         # across any same-tier neighbors.
