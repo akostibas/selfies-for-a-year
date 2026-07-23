@@ -217,9 +217,11 @@ uv run python -m selfies_for_a_year compile <input-dir> --output output.mp4
 For debugging visuals, pass `--debug-tier-overlay --debug-filename-overlay`
 to annotate every frame with the current pacing tier and the source filename.
 
-See [docs/what-we-tried.md](docs/what-we-tried.md) for approaches we tried and
-moved on from, and [docs/render-log.md](docs/render-log.md) for the
-chronological log of experimental renders.
+See [docs/intent.md](docs/intent.md) for the product intent (what this tool
+is for and its deliberate non-goals), [docs/what-we-tried.md](docs/what-we-tried.md)
+for approaches we tried and moved on from, and
+[docs/render-log.md](docs/render-log.md) for the chronological log of
+experimental renders.
 
 ## License
 
