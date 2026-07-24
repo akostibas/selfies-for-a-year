@@ -514,10 +514,15 @@ def _detect_beats(
 
 # occupancy < edge -> target photos/sec at the normal tier. Coarse by design
 # (a fitted curve on a handful of tracks is overfitting); bands are musical.
+# occupancy < edge -> target photos/sec. Even-beat snapping is coarse (at ~143
+# BPM most tracks land on 'every 6' = 0.40), so the bands mainly separate the
+# EXTREMES: near-silent ambient lingers (every 8), wall-of-sound drives (every
+# 4). Owner calibration: TBAH (occ 0.37) reads too slow at 0.30/every-8 and
+# right at 0.40/every-6 — so the broad middle targets 0.40.
 _OCCUPANCY_PACE_LADDER: tuple[tuple[float, float], ...] = (
-    (0.45, 0.30),   # sparse (ballad / orchestral) -> lingering, ~every 2 bars
-    (0.80, 0.37),   # medium
-    (2.00, 0.40),   # dense (techno / wall-of-sound) -> driving
+    (0.25, 0.30),   # very sparse (near-silent / ambient) -> every 8, lingering
+    (0.85, 0.40),   # normal range (ballad..dense) -> every 6  (owner's split)
+    (2.00, 0.55),   # very dense (wall-of-sound) -> every 4, driving
 )
 _NORMAL_PPS_CLAMP = (0.15, 1.0)  # guard: don't strobe or freeze on outliers
 
@@ -1377,6 +1382,7 @@ def build_timeline(
     # Occupancy base pace: set the normal-tier subdivision from the song's own
     # spectral density (octave-free, from median-IBI), overriding the photo-count
     # driven subdivision. An explicit --beat-speed still wins over this.
+    cut_felt_parity: int | None = None
     if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
         import librosa
 
@@ -1384,6 +1390,14 @@ def build_timeline(
         occ_sub, _occ, _pps = _occupancy_base_subdivision(y_occ, sr_occ, beat_times)
         if occ_sub is not None:
             beat_speed = occ_sub
+            # Felt-downbeat parity: on a doubled grid the true pulse is every
+            # OTHER beat; the stronger-onset parity (four-on-floor kick / ballad
+            # chord) is the "1 & 2". Snapping cuts to it keeps every flip on the
+            # felt pulse across tier boundaries, instead of odd tier spacings
+            # (e.g. intense every 3 beats) drifting cuts onto the off-beat.
+            s = np.asarray(strengths, dtype=float)
+            if len(s) > 3:
+                cut_felt_parity = 0 if s[0::2].mean() >= s[1::2].mean() else 1
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
@@ -1565,6 +1579,17 @@ def build_timeline(
             else:
                 local = sub
             phase += local
+            if cut_felt_parity is not None:
+                # Felt-locked: emit only ON felt-parity beats, one flip per beat,
+                # placed exactly on the beat (no sub-beat subdivision). Phase keeps
+                # accumulating on off-parity beats and discharges at the next felt
+                # beat, so every cut lands on the felt pulse regardless of tier.
+                if phase >= 1.0 - 1e-9 and (k % 2) == cut_felt_parity:
+                    t = float(beat_times[k])
+                    out.append((t, _kind_at(t)))
+                    phase -= 1.0
+                phase = min(phase, 2.0)  # cap so a long off-parity wait can't burst
+                continue
             n_emits = int(phase + 1e-9)
             if n_emits > 0:
                 gap = (
