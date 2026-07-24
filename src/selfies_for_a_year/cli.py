@@ -10,7 +10,7 @@ from typing import Annotated
 import click
 import typer
 from PIL import Image, ImageDraw, ImageFont
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from selfies_for_a_year.images import (
     discover_images,
@@ -602,8 +602,8 @@ def _maybe_materialize_from_icloud(
     if not force:
         try:
             ans = input(
-                f"Screen local thumbnails and download missing originals from iCloud "
-                f"to /tmp? [y/N] "
+                "Screen local thumbnails and download missing originals from iCloud "
+                "to /tmp? [y/N] "
             ).strip().lower()
         except EOFError:
             ans = ""
@@ -612,7 +612,10 @@ def _maybe_materialize_from_icloud(
             raise typer.Exit(1)
 
     from selfies_for_a_year.icloud import (
-        authorize, screen_derivatives, download_many, CACHE_DIR,
+        CACHE_DIR,
+        authorize,
+        download_many,
+        screen_derivatives,
     )
     from selfies_for_a_year.photos import _DEFAULT_LIBRARY
 
@@ -728,7 +731,7 @@ def _collect_sources(
     # Collect Apple Photos
     photos_items: list[_SourceItem] = []
     if apple_photos_name is not None:
-        from selfies_for_a_year.photos import find_person, query_photos, deduplicate_by_day
+        from selfies_for_a_year.photos import deduplicate_by_day, find_person, query_photos
 
         person = find_person(apple_photos_name)
         if person is None:
@@ -1057,8 +1060,11 @@ def compile(
     if preview_seconds is not None:
         k = max(2, int(preview_seconds * max_photos_per_second) + 2)
         if k < len(paths):
-            paths = paths[:k]; dates = dates[:k]; labels = labels[:k]
-            face_hints = face_hints[:k]; apple_quality = apple_quality[:k]
+            paths = paths[:k]
+            dates = dates[:k]
+            labels = labels[:k]
+            face_hints = face_hints[:k]
+            apple_quality = apple_quality[:k]
             typer.echo(f"Preview: first {preview_seconds:g}s — aligning {len(paths)} photos only.")
 
     # --- Pass 1: Align/prepare all frames ---
@@ -1185,10 +1191,10 @@ def compile(
             # shorten the video. Points at the main knobs the user can loosen.
             if total_in > 0 and total_dropped / total_in > 0.50:
                 typer.echo(
-                    f"\nWarning: over half of source photos were dropped. "
-                    f"To loosen: lower --min-face-fraction / --min-face-quality, "
-                    f"raise --max-tastefully-blurred, or check for "
-                    f"misframed/wrong-person photos in the source.",
+                    "\nWarning: over half of source photos were dropped. "
+                    "To loosen: lower --min-face-fraction / --min-face-quality, "
+                    "raise --max-tastefully-blurred, or check for "
+                    "misframed/wrong-person photos in the source.",
                     err=True,
                 )
 

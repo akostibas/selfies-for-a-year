@@ -135,7 +135,6 @@ class BeatTimeline:
                     if start - 1e-6 <= st < end - 1e-6
                 ]
                 if region_durs:
-                    min_d = min(region_durs)
                     max_d = max(region_durs)
                     min_rate = 1.0 / max_d if max_d > 0 else 0.0
                     extreme = (
@@ -290,7 +289,7 @@ class TrackProgression:
     warnings: list[str]
 
     @classmethod
-    def from_timeline(cls, timeline: "BeatTimeline") -> "TrackProgression":
+    def from_timeline(cls, timeline: BeatTimeline) -> TrackProgression:
         # States: reuse the same priority-ranked interval computation the
         # printed pacing timeline uses, collapsed to base tiers and merged
         # across any same-tier neighbors.
@@ -736,7 +735,8 @@ def _coalesce_strikes(
             if h[i] > keep_h[-1]:
                 keep_t[-1], keep_h[-1] = t[i], h[i]
         else:
-            keep_t.append(t[i]); keep_h.append(h[i])
+            keep_t.append(t[i])
+            keep_h.append(h[i])
     return np.asarray(keep_t)
 
 
@@ -826,7 +826,7 @@ def _onset_anchor_spans(
 
 def _onset_anchor_cuts(
     span: tuple[float, float], strikes: np.ndarray,
-    tier_at: "callable", ambient_default: str = "slow",
+    tier_at: callable, ambient_default: str = "slow",
 ) -> list[tuple[float, str]]:
     """Cut times inside an onset-anchor span: emit on prominent strikes at the
     tier's photos-per-strike cadence (intense=every strike, normal=every 2nd,
@@ -848,7 +848,7 @@ def _splice_onset_anchor(
     transitions: list[tuple[float, str]],
     spans: list[tuple[float, float]],
     strikes: np.ndarray,
-    tier_at: "callable",
+    tier_at: callable,
     heights: np.ndarray | None = None,
 ) -> list[tuple[float, str]]:
     """Replace grid transitions inside onset-anchor spans with strike-anchored
@@ -1477,7 +1477,8 @@ def _pace_tiers_segment(
     logrms = np.log(np.maximum(rms, 1e-6))
     mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop, n_mfcc=13)
 
-    p90 = lambda a: float(np.percentile(a, 90)) if len(a) else 0.0
+    def p90(a):
+        return float(np.percentile(a, 90)) if len(a) else 0.0
     height_raw = _pace_beat_agg(logcent, bf, agg=p90)        # per-beat cyan height
     lrms_beat = _pace_beat_agg(logrms, bf)
     loud_beat = _pace_beat_agg(rms_db, bf)
@@ -1559,9 +1560,11 @@ def _pace_tiers_to_regions(
         b = float(beat_times[j + 1]) if j + 1 < n else audio_duration
         t = tiers[i]
         if t == "intense":
-            intense.append((a, b)); intense_mask[i : j + 1] = True
+            intense.append((a, b))
+            intense_mask[i : j + 1] = True
         elif t == "slow":
-            slow.append((a, b)); slow_mask[i : j + 1] = True
+            slow.append((a, b))
+            slow_mask[i : j + 1] = True
         elif t == "ambient":
             ambient.append((a, b))
         else:
