@@ -1062,6 +1062,159 @@ def _pace_tiers_viterbi(
     return _pace_merge_short_runs(tiers, min_beats)
 
 
+# --------------------------------------------------------------------------- #
+# Segment-first pacing model ("segment"): Foote novelty on stacked beat-synced
+# features cuts the song into sections, then each SECTION is scored by its
+# cyan-height (p90 spectral-centroid envelope) and labelled against mode-anchored
+# tier centers. Boundaries land on beats by construction, so tier changes are
+# crisp; scoring a whole section by its interior median avoids the per-beat
+# chatter the height signal alone would produce. Developed in
+# experiments/pacing_recipes.py (recipe_c); see docs there for the derivation.
+# --------------------------------------------------------------------------- #
+def _pace_beat_agg(arr: np.ndarray, beat_frames: np.ndarray, agg=np.mean) -> np.ndarray:
+    """Aggregate a per-frame feature over each beat's window [beat_i, beat_i+1).
+    Window stat (not point-sample) so a bursty beat reflects its bursts."""
+    n = len(beat_frames)
+    out = np.zeros(n)
+    for i in range(n):
+        lo = int(beat_frames[i])
+        hi = int(beat_frames[i + 1]) if i + 1 < n else len(arr)
+        out[i] = agg(arr[lo:hi]) if hi > lo else arr[min(lo, len(arr) - 1)]
+    return out
+
+
+def _pace_beat_smooth(x: np.ndarray, w: int = 8) -> np.ndarray:
+    """Centered moving mean over ~w beats (1-D or per-column for 2-D)."""
+    from scipy.ndimage import uniform_filter1d
+
+    if x.ndim == 1:
+        return uniform_filter1d(x, w, mode="nearest")
+    return np.column_stack(
+        [uniform_filter1d(x[:, k], w, mode="nearest") for k in range(x.shape[1])]
+    )
+
+
+def _pace_foote_novelty(ssm: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Foote checkerboard novelty along the diagonal of a self-similarity matrix."""
+    L = kernel_size
+    g = np.linspace(-1.0, 1.0, 2 * L)
+    gauss = np.outer(np.exp(-4.0 * g**2), np.exp(-4.0 * g**2))
+    sign = np.outer(np.sign(g), np.sign(g))
+    kernel = gauss * sign
+    n = ssm.shape[0]
+    nov = np.zeros(n)
+    for i in range(n):
+        a, b = i - L, i + L
+        pa, pb = max(0, a), min(n, b)
+        ka, kb = pa - a, 2 * L - (b - pb)
+        nov[i] = float((ssm[pa:pb, pa:pb] * kernel[ka:kb, ka:kb]).sum())
+    nov = np.maximum(nov, 0.0)
+    if nov.max() > 0:
+        nov = nov / nov.max()
+    return nov
+
+
+def _pace_mode_anchored_centers(vals: np.ndarray) -> np.ndarray:
+    """Tier centers anchored at the BASELINE (mode = the groove the song sits at
+    most often), with asymmetric up/down spread. The median is dragged up by
+    peaks and pushes the baseline into 'slow'; the mode stays put."""
+    lo, hi = float(np.percentile(vals, 5)), float(np.percentile(vals, 95))
+    hist, edges = np.histogram(vals, bins=20, range=(vals.min(), vals.max() + 1e-9))
+    mode = 0.5 * (edges[hist.argmax()] + edges[hist.argmax() + 1])
+    up = max(hi - mode, 0.05)
+    dn = max(mode - lo, 0.05)
+    return np.clip(
+        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0, 1.0
+    )
+
+
+def _pace_tiers_segment(
+    audio_path: Path,
+    beat_times: np.ndarray,
+    bpm: float,
+    *,
+    kernel_beats: int = 16,
+    min_seg_beats: int = 16,
+    prominence: float = 0.12,
+    depth_boost: float = 0.6,
+) -> list[str]:
+    """Per-beat pacing tiers via the segment-first cyan-height model (recipe C).
+
+    1. Beat-synced texture features (log-centroid p90 = cyan height, log-RMS,
+       MFCC, modulation depth) -> cosine SSM -> Foote novelty -> segment cuts.
+    2. Per-beat energy = cyan height + variance-gated loudness booster, plus a
+       modulation-depth boost that rescues burst trains (median energy sits in
+       the gaps; depth is high there).
+    3. Mode-anchored tier centers over the per-beat combined signal; each SEGMENT
+       labelled by the nearest center to its median.
+    """
+    import librosa
+
+    if len(beat_times) < 8:
+        return ["ambient"] * len(beat_times)
+
+    y, sr = librosa.load(str(audio_path), mono=True)
+    hop = 512
+    bf = np.clip(np.asarray(librosa.time_to_frames(beat_times, sr=sr, hop_length=hop), dtype=int), 0, None)
+
+    cent = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
+    logcent = np.log2(np.maximum(cent, 1e-6))
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-6))
+    logrms = np.log(np.maximum(rms, 1e-6))
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop, n_mfcc=13)
+
+    p90 = lambda a: float(np.percentile(a, 90)) if len(a) else 0.0
+    height_raw = _pace_beat_agg(logcent, bf, agg=p90)        # per-beat cyan height
+    lrms_beat = _pace_beat_agg(logrms, bf)
+    loud_beat = _pace_beat_agg(rms_db, bf)
+    mfcc_beat = np.column_stack([_pace_beat_agg(mfcc[k], bf) for k in range(mfcc.shape[0])])
+
+    # modulation depth: p90-p10 of raw height over ~16 beats (burst-train marker)
+    n = len(height_raw)
+    moddepth = np.zeros(n)
+    for i in range(n):
+        a, b = max(0, i - 8), min(n, i + 9)
+        wnd = height_raw[a:b]
+        moddepth[i] = np.percentile(wnd, 90) - np.percentile(wnd, 10) if len(wnd) else 0.0
+
+    # per-beat energy: cyan height + one-way, variance-gated loudness booster
+    height_n = _pace_robust_norm(height_raw)
+    loud_n = _pace_robust_norm(loud_beat)
+    iqr_db = float(np.percentile(loud_beat, 75) - np.percentile(loud_beat, 25))
+    w_loud = float(np.clip((iqr_db - 3.0) / 6.0, 0.0, 1.0))
+    energy = (height_n + w_loud * loud_n) / (1.0 + w_loud)
+    combined = energy + depth_boost * _pace_robust_norm(moddepth)
+
+    # segment boundaries: Foote novelty on TEXTURE-WINDOWED stacked features
+    if n < 2 * kernel_beats:
+        bounds = [0]
+    else:
+        level = _pace_beat_smooth(np.column_stack([mfcc_beat, lrms_beat, height_raw]), 8)
+        feat = np.column_stack([level, moddepth])
+        feat = (feat - feat.mean(0)) / (feat.std(0) + 1e-9)
+        fn = feat / np.maximum(np.linalg.norm(feat, axis=1, keepdims=True), 1e-9)
+        ssm = fn @ fn.T
+        kb = min(kernel_beats, n // 2) or 1
+        nov = _pace_foote_novelty(ssm, kb)
+        from scipy.signal import find_peaks
+
+        peaks, _ = find_peaks(nov, prominence=prominence, distance=max(min_seg_beats, kb))
+        bounds = sorted(set([0] + [int(p) for p in peaks]))
+
+    seg_edges = list(zip(bounds, bounds[1:] + [n]))
+    centers = _pace_mode_anchored_centers(combined)
+    tiers = ["normal"] * n
+    for s0, s1 in seg_edges:
+        if s1 <= s0:
+            continue
+        score = float(np.median(combined[s0:s1]))
+        tier = _PACE_TIERS[int(np.argmin((score - centers) ** 2))]
+        for i in range(s0, s1):
+            tiers[i] = tier
+    return tiers
+
+
 def _pace_tiers_to_regions(
     tiers: list[str], beat_times: np.ndarray, audio_duration: float
 ) -> tuple[
@@ -1221,11 +1374,16 @@ def build_timeline(
         # An extended slow region might now overlap an intense one — intense wins.
         slow_mask &= ~intense_mask
 
-    # Viterbi pacing model: replace the region set computed above with tiers
-    # from the RMS-loudness + onset-rate energy signal. Overwrites rather than
-    # branches so all downstream transition/segment logic is shared.
-    if pace_model == "viterbi" and vary_pace and len(beat_times) > 0:
-        tiers = _pace_tiers_viterbi(audio_path, beat_times, bpm)
+    # Model-driven pacing: replace the region set computed above with per-beat
+    # tiers from an energy model. Overwrites rather than branches so all
+    # downstream transition/segment logic is shared. "viterbi" = RMS-loudness +
+    # onset-rate energy, Viterbi-labelled; "segment" = Foote-segmented
+    # cyan-height, per-section scored (recipe C).
+    if pace_model in ("viterbi", "segment") and vary_pace and len(beat_times) > 0:
+        if pace_model == "segment":
+            tiers = _pace_tiers_segment(audio_path, beat_times, bpm)
+        else:
+            tiers = _pace_tiers_viterbi(audio_path, beat_times, bpm)
         (intense_regions, slow_regions, ambient_regions, beat_regions,
          intense_mask, slow_mask) = _pace_tiers_to_regions(tiers, beat_times, audio_duration)
         eff_intense_mult = intense_multiplier
