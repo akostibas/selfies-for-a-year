@@ -97,3 +97,48 @@ def test_no_cuts_when_all_off_parity_region_is_short():
     ambient = np.zeros(n, bool)
     idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
     assert idxs[0] == 0
+
+
+# --- salience quantization: gaps can't rotate the cut through the weak beats --- #
+
+
+def _tier_gap(idxs, parity, lo, hi):
+    pts = [_felt_index(k, parity) for k in idxs if lo <= k < hi]
+    d = np.diff(pts)
+    # gap is constant within a tier (proven elsewhere) -> the single value
+    return int(d[0]) if len(d) else None
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize("sub", [1 / 4, 1 / 6, 1 / 8])
+def test_normal_gap_is_even(parity, sub):
+    """The normal-tier felt-beat gap must be even, so cuts stay on the {1,3}
+    strong/medium subgroup of a 4-beat bar instead of walking onto 2 & 4."""
+    n = 400
+    intense, slow, ambient = _masks(n, [])  # all normal
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    g = _tier_gap(idxs, parity, 0, n)
+    assert g is not None and g % 2 == 0, f"normal gap {g} must be even"
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize("bar", [3, 4])
+def test_slow_gap_is_bar_multiple(parity, bar):
+    """The slow-tier felt-beat gap must be a whole number of bars, so every cut
+    lands on the same bar position (one clean cut per N bars)."""
+    n = 500
+    intense, slow, ambient = _masks(n, [(0, n, "slow")])
+    idxs = _felt_locked_cut_indices(
+        n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity, bar_felt_beats=bar
+    )
+    g = _tier_gap(idxs, parity, 0, n)
+    assert g is not None and g % bar == 0, f"slow gap {g} must be a multiple of the bar {bar}"
+
+
+def test_intense_cuts_every_felt_beat():
+    """Intense tier cuts on every felt beat — dense weak landings are the point."""
+    n = 200
+    intense, slow, ambient = _masks(n, [(0, n, "intense")])
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
+    g = _tier_gap(idxs, 0, 0, n)
+    assert g == 1, f"intense gap {g} must be 1 (every felt beat)"
