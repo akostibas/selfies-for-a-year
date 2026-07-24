@@ -906,6 +906,7 @@ def compile(
     pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections), 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled), or 'segment' (Foote-segmented cyan-height, per-section scored; best structural alignment). 'viterbi'/'segment' imply --vary-pace.")] = "current",
     base_pace: Annotated[str, typer.Option(help="[--beat-sync] Base (normal-tier) photo density: 'current' (packs to fit the photo set) or 'occupancy' (matches the song's spectral density — sparse songs linger, dense songs drive; subsets photos to hold the pace). Octave-free; overridden by --beat-speed.")] = "current",
     onset_anchor: Annotated[str, typer.Option(help="[--base-pace occupancy] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
+    intense_per_kick: Annotated[str, typer.Option(help="[--base-pace occupancy] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
     preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
@@ -1003,6 +1004,9 @@ def compile(
         raise typer.Exit(1)
     if onset_anchor not in ("auto", "never", "always"):
         typer.echo(f"Error: --onset-anchor must be 'auto', 'never', or 'always', got '{onset_anchor}'.", err=True)
+        raise typer.Exit(1)
+    if intense_per_kick not in ("auto", "on", "off"):
+        typer.echo(f"Error: --intense-per-kick must be 'auto', 'on', or 'off', got '{intense_per_kick}'.", err=True)
         raise typer.Exit(1)
     if pace_model in ("viterbi", "segment"):
         vary_pace = True  # model-driven tiers only mean something with multipliers
@@ -1236,6 +1240,7 @@ def compile(
             pace_model=pace_model,
             base_pace=base_pace,
             onset_anchor=onset_anchor,
+            intense_per_kick=intense_per_kick,
         )
         typer.echo(timeline.summary())
 

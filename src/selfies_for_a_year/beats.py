@@ -1697,6 +1697,7 @@ def build_timeline(
     pace_model: str = "current",
     base_pace: str = "current",
     onset_anchor: str = "auto",
+    intense_per_kick: str = "auto",
 ) -> BeatTimeline:
     """Build a beat-aligned timeline matching photos to transition times.
 
@@ -1744,7 +1745,12 @@ def build_timeline(
         # not just the felt/parity ones? If so, intense cuts once per kick (every
         # detected beat) instead of every 2nd — the owner's "1 cut per kick".
         # Kick-band + min-parity, so an eighth-note-hat doubled track can't fake it.
-        if len(beat_times) > 3:
+        # --intense-per-kick on|off overrides the auto detection per song.
+        if intense_per_kick == "on":
+            intense_every_beat = True
+        elif intense_per_kick == "off":
+            intense_every_beat = False
+        elif len(beat_times) > 3:
             intense_every_beat = _kick_on_every_beat(y_occ, sr_occ, beat_times)
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
