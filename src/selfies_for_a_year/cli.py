@@ -904,8 +904,12 @@ def compile(
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
-    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering.")] = False,
-    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering.")] = False,
+    # COMPAT: default-on for review renders while we tune pacing. Production
+    # renders must pass --no-debug-progression-overlay --no-debug-metronome (plus
+    # --no-debug-tier-overlay --no-debug-filename-overlay) for a clean output.
+    # Revisit / restore False defaults once a production render path exists. Remove after 2026-08-24.
+    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering. Default-on for review (COMPAT).")] = True,
+    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering. Default-on for review (COMPAT).")] = True,
     emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
     emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
     analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
