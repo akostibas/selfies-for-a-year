@@ -901,6 +901,7 @@ def compile(
     snap_to_grid: Annotated[bool, typer.Option(help="[--vary-pace] Snap --intense/--slow-multiplier to the nearest power-of-2 musical fraction (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16) so cuts stay on the 4/4 grid. Disable to allow triplets/polyrhythms.")] = True,
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
     pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections), 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled), or 'segment' (Foote-segmented cyan-height, per-section scored; best structural alignment). 'viterbi'/'segment' imply --vary-pace.")] = "current",
+    base_pace: Annotated[str, typer.Option(help="[--beat-sync] Base (normal-tier) photo density: 'current' (packs to fit the photo set) or 'occupancy' (matches the song's spectral density — sparse songs linger, dense songs drive; subsets photos to hold the pace). Octave-free; overridden by --beat-speed.")] = "current",
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
@@ -991,6 +992,9 @@ def compile(
 
     if pace_model not in ("current", "viterbi", "segment"):
         typer.echo(f"Error: --pace-model must be 'current', 'viterbi', or 'segment', got '{pace_model}'.", err=True)
+        raise typer.Exit(1)
+    if base_pace not in ("current", "occupancy"):
+        typer.echo(f"Error: --base-pace must be 'current' or 'occupancy', got '{base_pace}'.", err=True)
         raise typer.Exit(1)
     if pace_model in ("viterbi", "segment"):
         vary_pace = True  # model-driven tiers only mean something with multipliers
@@ -1212,6 +1216,7 @@ def compile(
             snap_to_grid=snap_to_grid,
             tier_lead_seconds=tier_lead_seconds,
             pace_model=pace_model,
+            base_pace=base_pace,
         )
         typer.echo(timeline.summary())
 

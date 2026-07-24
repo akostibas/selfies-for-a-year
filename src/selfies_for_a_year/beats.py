@@ -492,6 +492,66 @@ def _detect_beats(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Occupancy-driven base pace ("--base-pace occupancy")
+#
+# The base (normal-tier) photo density should match the SONG, not the photo
+# count: a sparse ballad should linger, a dense track should drive. The owner's
+# own signal — "how much black is in the spectrogram" — measures this directly
+# (spectral occupancy). Two hard rules from the audio-engineer consult:
+#  * Denominate OCTAVE-FREE. The detected-tempo scalar (e.g. a 143.55 BPM bin)
+#    is a per-track coin flip on the octave, so pace never multiplies it. We use
+#    median inter-beat-interval for the fine grid, then convert a wall-clock
+#    target (photos/sec) to the nearest EVEN beats-per-photo. An even count on a
+#    doubled grid is a whole count on the felt grid, so the schedule stays
+#    musical under either octave hypothesis; odd counts read mechanical.
+#  * Occupancy is the pipeline's only CROSS-song absolute, so it must be
+#    level-normalized: perceptual-weight first (inaudible sub-bass shouldn't
+#    fill cells), then threshold relative to the song's own p95 (mastering
+#    loudness shouldn't bias it).
+# Ladder + clamp are declarative so the mapping is visible, not hidden in code.
+# --------------------------------------------------------------------------- #
+
+# occupancy < edge -> target photos/sec at the normal tier. Coarse by design
+# (a fitted curve on a handful of tracks is overfitting); bands are musical.
+_OCCUPANCY_PACE_LADDER: tuple[tuple[float, float], ...] = (
+    (0.45, 0.30),   # sparse (ballad / orchestral) -> lingering, ~every 2 bars
+    (0.80, 0.37),   # medium
+    (2.00, 0.40),   # dense (techno / wall-of-sound) -> driving
+)
+_NORMAL_PPS_CLAMP = (0.15, 1.0)  # guard: don't strobe or freeze on outliers
+
+
+def _spectral_occupancy(y: np.ndarray, sr: int, hop: int = 512) -> float:
+    """Fraction of the (perceptually-weighted) spectrogram that is 'lit',
+    thresholded relative to the song's own p95 level. High = dense/busy (little
+    black) -> faster base; low = sparse (much black) -> slower base."""
+    import librosa
+
+    S = np.abs(librosa.stft(y, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr)
+    Sw = librosa.perceptual_weighting(S, freqs)  # dB, de-emphasizes inaudible LF
+    p95 = float(np.percentile(Sw, 95))
+    return float((Sw > (p95 - 30.0)).mean())
+
+
+def _occupancy_base_subdivision(
+    y: np.ndarray, sr: int, beat_times: np.ndarray
+) -> tuple[float | None, float, float]:
+    """Return (subdivision photos-per-beat, occupancy, actual photos/sec) for the
+    normal tier, octave-free. subdivision is None if the grid is unusable."""
+    bt = np.asarray(beat_times, dtype=float)
+    ibi = np.diff(bt)
+    if len(ibi) == 0:
+        return None, 0.0, 0.0
+    bps = 1.0 / float(np.median(ibi))  # fine-grid beats/sec from IBIs, not the scalar
+    occ = _spectral_occupancy(y, sr)
+    target = next(t for edge, t in _OCCUPANCY_PACE_LADDER if occ < edge)
+    beats_per_photo = max(2, int(round((bps / target) / 2.0) * 2))  # nearest EVEN
+    actual_pps = float(np.clip(bps / beats_per_photo, *_NORMAL_PPS_CLAMP))
+    return 1.0 / beats_per_photo, occ, actual_pps
+
+
 def _pick_subdivision(
     bpm: float,
     max_pps: float,
@@ -1297,6 +1357,7 @@ def build_timeline(
     snap_to_grid: bool = True,
     tier_lead_seconds: float = 0.0,
     pace_model: str = "current",
+    base_pace: str = "current",
 ) -> BeatTimeline:
     """Build a beat-aligned timeline matching photos to transition times.
 
@@ -1312,6 +1373,17 @@ def build_timeline(
     beat_regions, ambient_regions = _classify_regions(
         beat_times, strengths, audio_duration, beat_thresh
     )
+
+    # Occupancy base pace: set the normal-tier subdivision from the song's own
+    # spectral density (octave-free, from median-IBI), overriding the photo-count
+    # driven subdivision. An explicit --beat-speed still wins over this.
+    if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
+        import librosa
+
+        y_occ, sr_occ = librosa.load(str(audio_path), mono=True)
+        occ_sub, _occ, _pps = _occupancy_base_subdivision(y_occ, sr_occ, beat_times)
+        if occ_sub is not None:
+            beat_speed = occ_sub
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
