@@ -604,6 +604,24 @@ def _felt_locked_cut_indices(
     return idxs
 
 
+def _drop_opening_flash(
+    transitions: list[tuple[float, str]],
+) -> list[tuple[float, str]]:
+    """Suppress an "out of the gate" cut. The timeline always starts a segment at
+    t=0, but the first real beat can land almost immediately (librosa's first
+    detected beat is often <1s in), so photo 1 would only flash before the actual
+    cadence begins. If that opening hold is much shorter than the next one (<half),
+    drop the first cut so photo 1 rides to the following cut — the owner would
+    rather the opening photo linger than see an instant flip. Pure; exercised by
+    tests/test_felt_lock.py."""
+    if len(transitions) >= 3 and transitions[0][0] < 1e-3:
+        lead = transitions[1][0] - transitions[0][0]
+        nxt = transitions[2][0] - transitions[1][0]
+        if nxt > 0 and lead < 0.5 * nxt:
+            return transitions[:1] + transitions[2:]
+    return transitions
+
+
 def _occupancy_base_subdivision(
     y: np.ndarray, sr: int, beat_times: np.ndarray
 ) -> tuple[float | None, float, float]:
@@ -1776,6 +1794,8 @@ def build_timeline(
             pre_roll.insert(0, 0.0)
         for t in reversed(pre_roll):
             transitions.insert(0, (float(t), "ambient"))
+
+    transitions = _drop_opening_flash(transitions)
 
     # Compute durations: each transition's duration is the gap to the next,
     # with the final segment running to audio_duration.

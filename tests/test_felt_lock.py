@@ -12,7 +12,7 @@ cuts), with synthetic per-beat tier masks so no audio is needed.
 import numpy as np
 import pytest
 
-from selfies_for_a_year.beats import _felt_locked_cut_indices
+from selfies_for_a_year.beats import _felt_locked_cut_indices, _drop_opening_flash
 
 
 def _masks(n, regions):
@@ -142,3 +142,29 @@ def test_intense_cuts_every_felt_beat():
     idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
     g = _tier_gap(idxs, 0, 0, n)
     assert g == 1, f"intense gap {g} must be 1 (every felt beat)"
+
+
+# --- opening flash suppression: photo 1 shouldn't flash out of the gate --- #
+
+
+def test_opening_flash_dropped_when_lead_is_short():
+    """A near-instant first cut (photo 1 flashes) is dropped so photo 1 rides."""
+    # t=0 start, first beat lands at 0.09s, then a 6.9s ambient hold.
+    tr = [(0.0, "ambient"), (0.09, "ambient"), (6.94, "ambient"), (13.8, "normal")]
+    out = _drop_opening_flash(tr)
+    assert out[0] == (0.0, "ambient")
+    assert out[1] == (6.94, "ambient"), "the 0.09s flash cut should be gone"
+
+
+def test_opening_flash_kept_when_lead_is_full():
+    """A normal-length opening hold is left alone."""
+    tr = [(0.0, "ambient"), (3.4, "normal"), (6.8, "normal"), (10.2, "normal")]
+    out = _drop_opening_flash(tr)
+    assert out == tr, "a full-length opening segment must not be coalesced"
+
+
+def test_opening_flash_noop_when_first_cut_not_at_zero():
+    """If the first transition isn't the t=0 start, don't touch it."""
+    tr = [(0.5, "ambient"), (0.6, "ambient"), (6.9, "ambient")]
+    out = _drop_opening_flash(tr)
+    assert out == tr
