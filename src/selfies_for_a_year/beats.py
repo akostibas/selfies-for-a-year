@@ -567,6 +567,7 @@ def _felt_locked_cut_indices(
     slow_mult: float,
     parity: int,
     bar_felt_beats: int = 4,
+    intense_every_beat: bool = False,
 ) -> list[int]:
     """Beat indices to cut on, felt-locked with a SALIENCE-QUANTIZED constant
     felt-beat gap per tier. Cuts only land on the felt-downbeat parity
@@ -575,6 +576,10 @@ def _felt_locked_cut_indices(
     weak beats of the bar (the owner's "1,2,1,2" complaint):
 
       * intense -> every felt beat (gap 1); dense weak landings are the point.
+        When `intense_every_beat` (the kick sits on EVERY detected beat, not just
+        the felt/parity ones — a driving four-on-floor track), intense instead
+        cuts on every detected beat: one flip per kick, the owner's ask. Doubled
+        tracks (kick only on parity beats) leave this off and stay every-felt.
       * normal  -> nearest EVEN felt-beat gap (>=2); an even gap has gcd>=2 with
         the 4-beat bar, so cuts stay on the {beat 1, beat 3} strong/medium
         subgroup instead of walking onto 2 & 4.
@@ -606,9 +611,18 @@ def _felt_locked_cut_indices(
     last_emit: int | None = None
     idxs: list[int] = []
     for k in range(n):
-        if (k % 2) != parity:
+        on_parity = (k % 2) == parity
+        if on_parity:
+            felt_idx += 1
+        # Intense on a track whose kick is on every beat: cut on every detected
+        # beat (parity AND off-parity) — one flip per kick.
+        if intense_mask[k] and intense_every_beat:
+            idxs.append(k)
+            if on_parity:
+                last_emit = felt_idx
             continue
-        felt_idx += 1
+        if not on_parity:
+            continue
         if intense_mask[k]:
             g = g_intense
         elif slow_mask[k] or ambient_mask[k]:
@@ -735,6 +749,42 @@ def _grid_support(felt_beats: np.ndarray, strikes: np.ndarray,
     strikes = np.asarray(strikes)
     hits = sum(1 for b in felt_beats if np.min(np.abs(strikes - b)) <= window_s)
     return hits / len(felt_beats)
+
+
+def _kick_on_every_beat(
+    y: np.ndarray, sr: int, beat_times: np.ndarray, *,
+    band: tuple[float, float] = (30.0, 150.0), thresh: float = 0.60,
+) -> bool:
+    """True when the KICK sits on every detected beat (a driving four-on-floor
+    track), so intense should cut once per kick. Two octave-proofing measures
+    (audio-engineer consult), both needed:
+
+      (a) band-limit to the kick band (~30-150 Hz): hats / shakers / guitar chugs
+          that also land every beat vanish, so we measure the KICK, not just
+          "onset energy on every beat".
+      (b) gate on min(even-parity, odd-parity) support, not the pooled mean: a
+          DOUBLED track whose kick is only on the felt (parity) beats reads ~1.0
+          on the strong side and ~0 on the weak side, so the min collapses;
+          genuine every-beat kicks read high on both. (NOT the accent-alternation
+          test — that detects meter, not octave, and misfires on Push.)"""
+    import librosa
+
+    bt = np.asarray(beat_times, dtype=float)
+    if len(bt) < 4:
+        return False
+    S = np.abs(librosa.stft(y)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr)
+    band_S = S[(freqs >= band[0]) & (freqs <= band[1]), :]
+    if band_S.shape[0] == 0:
+        return False
+    env = librosa.onset.onset_strength(S=librosa.power_to_db(band_S + 1e-10), sr=sr)
+    peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, backtrack=False)
+    strikes = librosa.frames_to_time(peaks, sr=sr)
+    if len(strikes) == 0:
+        return False
+    even = _grid_support(bt[0::2], strikes)
+    odd = _grid_support(bt[1::2], strikes)
+    return min(even, odd) >= thresh
 
 
 def _onset_anchor_spans(
@@ -1670,6 +1720,7 @@ def build_timeline(
     onset_strikes: np.ndarray = np.array([])
     onset_strike_heights: np.ndarray = np.array([])
     onset_anchor_spans_final: list[tuple[float, float]] = []
+    intense_every_beat: bool = False
     if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
         import librosa
 
@@ -1689,6 +1740,12 @@ def build_timeline(
         # the beat grid is fiction (see _prominent_strikes / _onset_anchor_spans).
         if onset_anchor != "never":
             onset_strikes, onset_strike_heights = _prominent_strikes(y_occ, sr_occ)
+        # Does the kick sit on EVERY detected beat (a driving four-on-floor track),
+        # not just the felt/parity ones? If so, intense cuts once per kick (every
+        # detected beat) instead of every 2nd — the owner's "1 cut per kick".
+        # Kick-band + min-parity, so an eighth-note-hat doubled track can't fake it.
+        if len(beat_times) > 3:
+            intense_every_beat = _kick_on_every_beat(y_occ, sr_occ, beat_times)
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
@@ -1868,6 +1925,7 @@ def build_timeline(
             for k in _felt_locked_cut_indices(
                 n, intense_mask, slow_mask, beat_is_ambient, sub,
                 intense_multiplier, slow_multiplier, cut_felt_parity,
+                intense_every_beat=intense_every_beat,
             ):
                 t = float(beat_times[k])
                 out.append((t, _kind_at(t)))

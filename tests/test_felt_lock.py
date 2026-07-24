@@ -144,6 +144,24 @@ def test_intense_cuts_every_felt_beat():
     assert g == 1, f"intense gap {g} must be 1 (every felt beat)"
 
 
+@pytest.mark.parametrize("parity", [0, 1])
+def test_intense_every_beat_cuts_on_every_detected_beat(parity):
+    """With intense_every_beat (kick on every beat), intense cuts on every
+    detected beat — parity AND off-parity — for one flip per kick."""
+    n = 60
+    intense, slow, ambient = _masks(n, [(20, 40, "intense")])
+    idxs = _felt_locked_cut_indices(
+        n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity, intense_every_beat=True
+    )
+    intense_cuts = [k for k in idxs if 20 <= k < 40]
+    # consecutive detected-beat indices -> gap of 1 in k, both parities present
+    assert intense_cuts == list(range(20, 40)), intense_cuts
+    # default (off) keeps the every-2nd (felt) spacing
+    off = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity)
+    off_intense = [k for k in off if 20 <= k < 40]
+    assert all((k % 2) == parity for k in off_intense)
+
+
 # --- opening flash suppression: photo 1 shouldn't flash out of the gate --- #
 
 
