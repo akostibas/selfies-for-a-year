@@ -540,6 +540,49 @@ def _spectral_occupancy(y: np.ndarray, sr: int, hop: int = 512) -> float:
     return float((Sw > (p95 - 30.0)).mean())
 
 
+def _felt_locked_cut_indices(
+    n: int,
+    intense_mask: np.ndarray,
+    slow_mask: np.ndarray,
+    ambient_mask: np.ndarray,
+    sub: float,
+    intense_mult: float,
+    slow_mult: float,
+    parity: int,
+) -> list[int]:
+    """Beat indices to cut on, felt-locked with a CONSTANT integer felt-beat gap
+    per tier. Cuts only ever land on the felt-downbeat parity (`parity`), and
+    within any tier the gap between consecutive cuts is a fixed whole number of
+    felt beats — so there is no 1/2-beat alternation and no drift across tier
+    boundaries. gap = round(detected-beats-per-photo / 2) scaled by the tier's
+    multiplier. Pure and deterministic; exercised by tests/test_felt_lock.py."""
+    def _felt_gap(mult: float) -> int:
+        if sub <= 0 or mult <= 0:
+            return 1
+        return max(1, int(round(1.0 / (2.0 * sub * mult))))
+
+    g_intense = _felt_gap(intense_mult)
+    g_slow = _felt_gap(slow_mult)
+    g_normal = _felt_gap(1.0)
+    felt_idx = -1
+    last_emit: int | None = None
+    idxs: list[int] = []
+    for k in range(n):
+        if (k % 2) != parity:
+            continue
+        felt_idx += 1
+        if intense_mask[k]:
+            g = g_intense
+        elif slow_mask[k] or ambient_mask[k]:
+            g = g_slow
+        else:
+            g = g_normal
+        if last_emit is None or (felt_idx - last_emit) >= g:
+            idxs.append(k)
+            last_emit = felt_idx
+    return idxs
+
+
 def _occupancy_base_subdivision(
     y: np.ndarray, sr: int, beat_times: np.ndarray
 ) -> tuple[float | None, float, float]:
@@ -1568,6 +1611,20 @@ def build_timeline(
             beat_is_ambient |= (beat_times >= a - 1e-6) & (beat_times <= b + 1e-6)
 
         n = len(beat_times)
+
+        if cut_felt_parity is not None:
+            # Occupancy felt-lock: cuts on the felt-downbeat parity at a CONSTANT
+            # integer felt-beat gap per tier (no 1/2-beat alternation). Uses the
+            # RAW tier multipliers so contrast stays wide. See _felt_locked_cut_
+            # indices + tests/test_felt_lock.py.
+            for k in _felt_locked_cut_indices(
+                n, intense_mask, slow_mask, beat_is_ambient, sub,
+                intense_multiplier, slow_multiplier, cut_felt_parity,
+            ):
+                t = float(beat_times[k])
+                out.append((t, _kind_at(t)))
+            return out
+
         phase = 0.0
         for k in range(n):
             if intense_mask[k]:
@@ -1579,17 +1636,6 @@ def build_timeline(
             else:
                 local = sub
             phase += local
-            if cut_felt_parity is not None:
-                # Felt-locked: emit only ON felt-parity beats, one flip per beat,
-                # placed exactly on the beat (no sub-beat subdivision). Phase keeps
-                # accumulating on off-parity beats and discharges at the next felt
-                # beat, so every cut lands on the felt pulse regardless of tier.
-                if phase >= 1.0 - 1e-9 and (k % 2) == cut_felt_parity:
-                    t = float(beat_times[k])
-                    out.append((t, _kind_at(t)))
-                    phase -= 1.0
-                phase = min(phase, 2.0)  # cap so a long off-parity wait can't burst
-                continue
             n_emits = int(phase + 1e-9)
             if n_emits > 0:
                 gap = (
