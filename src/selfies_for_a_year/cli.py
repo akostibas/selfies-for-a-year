@@ -431,6 +431,7 @@ def _beat_frames(
     bpm: float | None = None,
     progression_states: list[tuple[float, float, str]] | None = None,
     metronome_beats: list[float] | None = None,
+    max_seconds: float | None = None,
 ) -> tuple[Iterator[Image.Image], int]:
     """Render beat-sync segments as constant-fps frames.
 
@@ -458,6 +459,8 @@ def _beat_frames(
 
     total_duration = sum(seg.duration for seg in segments)
     n_frames = max(1, round(total_duration * fps))
+    if max_seconds is not None:
+        n_frames = min(n_frames, max(1, round(max_seconds * fps)))
 
     # The metronome dot rides at a fixed screen position (end of the debug
     # block's BPM row), so compute its anchor once rather than per frame.
@@ -903,11 +906,11 @@ def compile(
     min_normal_bridge_beats: Annotated[float, typer.Option(help="[--vary-pace] Tiny 'normal' bridges between two overlay regions (slow→intense etc.) shorter than this many beats get absorbed into the next region so the transition is direct.")] = 8.0,
     snap_to_grid: Annotated[bool, typer.Option(help="[--vary-pace] Snap --intense/--slow-multiplier to the nearest power-of-2 musical fraction (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16) so cuts stay on the 4/4 grid. Disable to allow triplets/polyrhythms.")] = True,
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
+    onset_anchor: Annotated[str, typer.Option(help="[--beat-sync] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
+    intense_per_kick: Annotated[str, typer.Option(help="[--beat-sync] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
+    preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
-    debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
-    debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
-    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering.")] = False,
-    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering.")] = False,
+    debug: Annotated[bool, typer.Option(help="Overlay ALL review HUDs: pacing tier + song/BPM, source filename, the track-progression bar with playhead, and the metronome dot (flashes on each cut target — strikes in onset-anchor spans). On for iteration/review; leave off for a clean production render. Forces constant-fps rendering.")] = False,
     emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
     emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
     analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
@@ -971,6 +974,23 @@ def compile(
         typer.echo("Error: --fit-to-music requires --music.", err=True)
         raise typer.Exit(1)
 
+    # Default to the settled beat-synced pacing pipeline. Providing --music alone
+    # gives a beat-synced, pace-varied render (segment tiers + occupancy base
+    # pace); opt out with --no-beat-sync (plain slideshow) or --no-vary-pace.
+    _src = ctx.get_parameter_source
+    _CMD = click.core.ParameterSource.COMMANDLINE
+    if music is not None and _src("beat_sync") != _CMD:
+        beat_sync = True
+    if beat_sync and _src("vary_pace") != _CMD:
+        vary_pace = True
+
+    # One --debug flag drives every review HUD; the render helpers still take the
+    # individual toggles internally.
+    debug_tier_overlay = debug
+    debug_filename_overlay = debug
+    debug_progression_overlay = debug
+    debug_metronome = debug
+
     if beat_sync and music is None:
         typer.echo("Error: --beat-sync requires --music.", err=True)
         raise typer.Exit(1)
@@ -985,6 +1005,13 @@ def compile(
             "require --beat-sync (the progression model is built from the beat timeline).",
             err=True,
         )
+        raise typer.Exit(1)
+
+    if onset_anchor not in ("auto", "never", "always"):
+        typer.echo(f"Error: --onset-anchor must be 'auto', 'never', or 'always', got '{onset_anchor}'.", err=True)
+        raise typer.Exit(1)
+    if intense_per_kick not in ("auto", "on", "off"):
+        typer.echo(f"Error: --intense-per-kick must be 'auto', 'on', or 'off', got '{intense_per_kick}'.", err=True)
         raise typer.Exit(1)
 
 
@@ -1026,6 +1053,19 @@ def compile(
         )
     else:
         typer.echo(f"Found {len(paths)} images. ({duration}ms/photo at {FPS}fps)")
+
+    # Preview mode: only the first N seconds are encoded, so only the photos that
+    # can appear in that window need aligning. Cap at the ceiling pace so we never
+    # starve the clip; the occupancy pace is slower, leaving a safe margin.
+    if preview_seconds is not None:
+        k = max(2, int(preview_seconds * max_photos_per_second) + 2)
+        if k < len(paths):
+            paths = paths[:k]
+            dates = dates[:k]
+            labels = labels[:k]
+            face_hints = face_hints[:k]
+            apple_quality = apple_quality[:k]
+            typer.echo(f"Preview: first {preview_seconds:g}s — aligning {len(paths)} photos only.")
 
     # --- Pass 1: Align/prepare all frames ---
     if align:
@@ -1203,6 +1243,10 @@ def compile(
             min_normal_bridge_beats=min_normal_bridge_beats,
             snap_to_grid=snap_to_grid,
             tier_lead_seconds=tier_lead_seconds,
+            pace_model="segment",
+            base_pace="occupancy",
+            onset_anchor=onset_anchor,
+            intense_per_kick=intense_per_kick,
         )
         typer.echo(timeline.summary())
 
@@ -1228,8 +1272,10 @@ def compile(
         progression_states = [(s.start, s.end, s.tier) for s in progression.states]
 
         # Validate bounds. Bounds are only enforced in auto mode; if the user
-        # set --beat-speed they've explicitly opted out of auto-pick.
-        if beat_speed is None and not force:
+        # set --beat-speed they've explicitly opted out of auto-pick. Preview
+        # mode deliberately uses only the first few photos, so the "too few to
+        # fill the song" guard doesn't apply — skip it like --force.
+        if beat_speed is None and not force and preview_seconds is None:
             problems: list[str] = []
             remedies: list[str] = []
             if timeline.bounds_violation == "ceiling":
@@ -1282,7 +1328,9 @@ def compile(
         # any render using them must go through the constant-fps generator —
         # even hard-cut mode, which otherwise holds one frame per segment.
         per_frame_overlays = debug_progression_overlay or debug_metronome
-        metronome_beats = timeline.beat_times if debug_metronome else None
+        # In onset-anchor spans the dot flashes on the real note strikes, not the
+        # fictional grid — so the owner scores beat-match against what we cut on.
+        metronome_beats = timeline.metronome_times() if debug_metronome else None
 
         if beat_crossfade or per_frame_overlays:
             frames_iter, n_out = _beat_frames(
@@ -1298,6 +1346,7 @@ def compile(
                 bpm=timeline.bpm,
                 progression_states=progression_states if debug_progression_overlay else None,
                 metronome_beats=metronome_beats,
+                max_seconds=preview_seconds,
             )
             mode = "continuous crossfade" if beat_crossfade else "constant-fps hard cut"
             typer.echo(
@@ -1366,7 +1415,7 @@ def compile(
                     f.write(f"{dt.strftime('%Y-%m-%d %H:%M:%S')}\t{path}\t{status}\t{reason}\n")
 
         typer.echo(
-            f"Done! {output} ({rendered_count} frames, {timeline.total_duration:.1f}s)"
+            f"Done! {output} ({rendered_count} frames, {rendered_count / FPS:.1f}s)"
         )
         return
 

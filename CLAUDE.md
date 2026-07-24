@@ -5,7 +5,7 @@
 - **Commit on each feature tweak the user likes.** Don't batch up changes — commit as soon as a feature or adjustment is confirmed working and approved.
 - Test changes against the 2026 selfies directory before presenting to the user.
 - Output test videos to `/tmp/` for review.
-- **Always include both debug overlays on non-production renders.** Pass `--debug-tier-overlay --debug-filename-overlay` whenever you render for review or iteration; only omit them when the user explicitly asks for a clean (production) render. The overlays show the current pacing tier (slow/normal/intense/ambient + photos-per-sec) and the source filename, which is essential context for diagnosing pacing or source-photo issues without re-rendering.
+- **Pass `--debug` on non-production renders.** One flag turns on all four review HUDs: pacing tier (slow/normal/intense/ambient + photos-per-sec), source filename, the metronome dot (flashes on each cut target — real strikes in onset-anchor spans), and the track-progression bar with playhead — essential context for diagnosing pacing or source-photo issues without re-rendering. It defaults **off**, so a clean **production** render is just the omission of `--debug`.
 - **Append a row to `docs/render-log.md` for every non-production render.** One row per render, pipe-separated table format (see header in the file for column definitions). Append immediately when the render finishes, and update the `feedback` column the moment the user reacts. The log is a grep target across hundreds of past iterations — keep each row terse.
 - **Local paths:** See `local.env` (gitignored) for machine-specific test paths. Key vars:
   - `SELFIES_BASE` — parent dir with per-year folders (2020/, 2021/, …, 2026/)

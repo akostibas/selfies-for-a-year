@@ -1,0 +1,188 @@
+"""Beat-lock guarantees for the occupancy pacer.
+
+Two properties the owner cares about, both automatable:
+  1. Every cut lands on the FELT-downbeat parity (the "1 & 2"), never the
+     in-between eighth-note — across tier boundaries.
+  2. Within any one tier section, consecutive cuts are a CONSTANT whole number
+     of felt beats apart — no 1,2,1,2 alternation.
+
+Tested against _felt_locked_cut_indices (the pure scheduler behind occupancy
+cuts), with synthetic per-beat tier masks so no audio is needed.
+"""
+import numpy as np
+import pytest
+
+from selfies_for_a_year.beats import _felt_locked_cut_indices, _drop_opening_flash
+
+
+def _masks(n, regions):
+    """regions: list of (start, end, tier). Returns intense/slow/ambient masks."""
+    intense = np.zeros(n, bool)
+    slow = np.zeros(n, bool)
+    ambient = np.zeros(n, bool)
+    for a, b, t in regions:
+        {"intense": intense, "slow": slow, "ambient": ambient}.get(t, intense)[a:b] = (
+            True if t in ("intense", "slow", "ambient") else False
+        )
+    return intense, slow, ambient
+
+
+def _felt_index(k, parity):
+    # index of beat k among the felt-parity beats (k has parity == parity)
+    return (k - parity) // 2
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize("sub", [1 / 6, 1 / 8, 1 / 4])
+def test_all_cuts_on_felt_parity(parity, sub):
+    n = 240
+    intense, slow, ambient = _masks(n, [(60, 120, "intense"), (160, 240, "slow")])
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    assert idxs, "expected some cuts"
+    assert all(k % 2 == parity for k in idxs), "every cut must be on the felt parity"
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+def test_constant_gap_within_each_tier(parity):
+    n = 300
+    # normal 0-90, intense 90-180, slow 180-300
+    intense, slow, ambient = _masks(n, [(90, 180, "intense"), (180, 300, "slow")])
+    sub = 1 / 6
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+
+    def tier_of(k):
+        if intense[k]:
+            return "intense"
+        if slow[k] or ambient[k]:
+            return "slow"
+        return "normal"
+
+    # Group consecutive cuts that share a tier; within each such run the felt-beat
+    # gap must be a single constant value.
+    fi = [_felt_index(k, parity) for k in idxs]
+    tiers = [tier_of(k) for k in idxs]
+    run_start = 0
+    for i in range(1, len(idxs) + 1):
+        if i == len(idxs) or tiers[i] != tiers[run_start]:
+            gaps = {fi[j] - fi[j - 1] for j in range(run_start + 1, i)}
+            assert len(gaps) <= 1, (
+                f"{tiers[run_start]} section has non-constant cut gaps {gaps}"
+            )
+            run_start = i
+
+
+def test_denser_tier_has_smaller_gap():
+    """intense should cut more often than normal, which cuts more often than slow."""
+    n = 300
+    intense, slow, ambient = _masks(n, [(90, 180, "intense"), (180, 300, "slow")])
+    sub = 1 / 6
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, 0)
+
+    def gap_in(mask_lo, mask_hi):
+        pts = [(_felt_index(k, 0)) for k in idxs if mask_lo <= k < mask_hi]
+        d = np.diff(pts)
+        return int(np.median(d)) if len(d) else None
+
+    g_normal = gap_in(0, 90)
+    g_intense = gap_in(90, 180)
+    g_slow = gap_in(180, 300)
+    assert g_intense < g_normal < g_slow, (g_intense, g_normal, g_slow)
+
+
+def test_no_cuts_when_all_off_parity_region_is_short():
+    """A tiny track still produces at least the opening cut."""
+    n = 8
+    intense = np.zeros(n, bool)
+    slow = np.zeros(n, bool)
+    ambient = np.zeros(n, bool)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
+    assert idxs[0] == 0
+
+
+# --- salience quantization: gaps can't rotate the cut through the weak beats --- #
+
+
+def _tier_gap(idxs, parity, lo, hi):
+    pts = [_felt_index(k, parity) for k in idxs if lo <= k < hi]
+    d = np.diff(pts)
+    # gap is constant within a tier (proven elsewhere) -> the single value
+    return int(d[0]) if len(d) else None
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize("sub", [1 / 4, 1 / 6, 1 / 8])
+def test_normal_gap_is_even(parity, sub):
+    """The normal-tier felt-beat gap must be even, so cuts stay on the {1,3}
+    strong/medium subgroup of a 4-beat bar instead of walking onto 2 & 4."""
+    n = 400
+    intense, slow, ambient = _masks(n, [])  # all normal
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    g = _tier_gap(idxs, parity, 0, n)
+    assert g is not None and g % 2 == 0, f"normal gap {g} must be even"
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+@pytest.mark.parametrize("bar", [3, 4])
+def test_slow_gap_is_bar_multiple(parity, bar):
+    """The slow-tier felt-beat gap must be a whole number of bars, so every cut
+    lands on the same bar position (one clean cut per N bars)."""
+    n = 500
+    intense, slow, ambient = _masks(n, [(0, n, "slow")])
+    idxs = _felt_locked_cut_indices(
+        n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity, bar_felt_beats=bar
+    )
+    g = _tier_gap(idxs, parity, 0, n)
+    assert g is not None and g % bar == 0, f"slow gap {g} must be a multiple of the bar {bar}"
+
+
+def test_intense_cuts_every_felt_beat():
+    """Intense tier cuts on every felt beat — dense weak landings are the point."""
+    n = 200
+    intense, slow, ambient = _masks(n, [(0, n, "intense")])
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
+    g = _tier_gap(idxs, 0, 0, n)
+    assert g == 1, f"intense gap {g} must be 1 (every felt beat)"
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+def test_intense_every_beat_cuts_on_every_detected_beat(parity):
+    """With intense_every_beat (kick on every beat), intense cuts on every
+    detected beat — parity AND off-parity — for one flip per kick."""
+    n = 60
+    intense, slow, ambient = _masks(n, [(20, 40, "intense")])
+    idxs = _felt_locked_cut_indices(
+        n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity, intense_every_beat=True
+    )
+    intense_cuts = [k for k in idxs if 20 <= k < 40]
+    # consecutive detected-beat indices -> gap of 1 in k, both parities present
+    assert intense_cuts == list(range(20, 40)), intense_cuts
+    # default (off) keeps the every-2nd (felt) spacing
+    off = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity)
+    off_intense = [k for k in off if 20 <= k < 40]
+    assert all((k % 2) == parity for k in off_intense)
+
+
+# --- opening flash suppression: photo 1 shouldn't flash out of the gate --- #
+
+
+def test_opening_flash_dropped_when_lead_is_short():
+    """A near-instant first cut (photo 1 flashes) is dropped so photo 1 rides."""
+    # t=0 start, first beat lands at 0.09s, then a 6.9s ambient hold.
+    tr = [(0.0, "ambient"), (0.09, "ambient"), (6.94, "ambient"), (13.8, "normal")]
+    out = _drop_opening_flash(tr)
+    assert out[0] == (0.0, "ambient")
+    assert out[1] == (6.94, "ambient"), "the 0.09s flash cut should be gone"
+
+
+def test_opening_flash_kept_when_lead_is_full():
+    """A normal-length opening hold is left alone."""
+    tr = [(0.0, "ambient"), (3.4, "normal"), (6.8, "normal"), (10.2, "normal")]
+    out = _drop_opening_flash(tr)
+    assert out == tr, "a full-length opening segment must not be coalesced"
+
+
+def test_opening_flash_noop_when_first_cut_not_at_zero():
+    """If the first transition isn't the t=0 start, don't touch it."""
+    tr = [(0.5, "ambient"), (0.6, "ambient"), (6.9, "ambient")]
+    out = _drop_opening_flash(tr)
+    assert out == tr

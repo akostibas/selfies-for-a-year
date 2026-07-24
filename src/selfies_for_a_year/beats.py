@@ -42,6 +42,23 @@ class BeatTimeline:
     intense_multiplier: float = 1.0
     slow_multiplier: float = 1.0
     beat_times: list[float] = field(default_factory=list)  # detected beat onsets, seconds
+    # Spans where the grid was fiction and cuts followed real note strikes.
+    onset_anchor_spans: list[tuple[float, float]] = field(default_factory=list)
+    onset_strikes: list[float] = field(default_factory=list)  # the strike times used there
+
+    def metronome_times(self) -> list[float]:
+        """Times the metronome dot should flash: detected beats where the grid
+        holds, but the real note STRIKES inside onset-anchor spans (so the dot
+        marks what we actually cut on, not a fictional grid)."""
+        if not self.onset_anchor_spans:
+            return list(self.beat_times)
+
+        def _in_span(t: float) -> bool:
+            return any(a <= t < b for a, b in self.onset_anchor_spans)
+
+        out = [t for t in self.beat_times if not _in_span(t)]
+        out += [t for t in self.onset_strikes if _in_span(t)]
+        return sorted(out)
 
     def _pacing_intervals(self) -> list[tuple[float, float, str]]:
         return _pacing_intervals_impl(
@@ -491,6 +508,388 @@ def _detect_beats(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Occupancy-driven base pace ("--base-pace occupancy")
+#
+# The base (normal-tier) photo density should match the SONG, not the photo
+# count: a sparse ballad should linger, a dense track should drive. The owner's
+# own signal — "how much black is in the spectrogram" — measures this directly
+# (spectral occupancy). Two hard rules from the audio-engineer consult:
+#  * Denominate OCTAVE-FREE. The detected-tempo scalar (e.g. a 143.55 BPM bin)
+#    is a per-track coin flip on the octave, so pace never multiplies it. We use
+#    median inter-beat-interval for the fine grid, then convert a wall-clock
+#    target (photos/sec) to the nearest EVEN beats-per-photo. An even count on a
+#    doubled grid is a whole count on the felt grid, so the schedule stays
+#    musical under either octave hypothesis; odd counts read mechanical.
+#  * Occupancy is the pipeline's only CROSS-song absolute, so it must be
+#    level-normalized: perceptual-weight first (inaudible sub-bass shouldn't
+#    fill cells), then threshold relative to the song's own p95 (mastering
+#    loudness shouldn't bias it).
+# Ladder + clamp are declarative so the mapping is visible, not hidden in code.
+# --------------------------------------------------------------------------- #
+
+# occupancy < edge -> target photos/sec at the normal tier. Coarse by design
+# (a fitted curve on a handful of tracks is overfitting); bands are musical.
+# occupancy < edge -> target photos/sec. Even-beat snapping is coarse (at ~143
+# BPM most tracks land on 'every 6' = 0.40), so the bands mainly separate the
+# EXTREMES: near-silent ambient lingers (every 8), wall-of-sound drives (every
+# 4). Owner calibration: TBAH (occ 0.37) reads too slow at 0.30/every-8 and
+# right at 0.40/every-6 — so the broad middle targets 0.40.
+_OCCUPANCY_PACE_LADDER: tuple[tuple[float, float], ...] = (
+    (0.25, 0.30),   # very sparse (near-silent / ambient) -> every 8, lingering
+    (0.85, 0.40),   # normal range (ballad..dense) -> every 6  (owner's split)
+    (2.00, 0.55),   # very dense (wall-of-sound) -> every 4, driving
+)
+_NORMAL_PPS_CLAMP = (0.15, 1.0)  # guard: don't strobe or freeze on outliers
+
+
+def _spectral_occupancy(y: np.ndarray, sr: int, hop: int = 512) -> float:
+    """Fraction of the (perceptually-weighted) spectrogram that is 'lit',
+    thresholded relative to the song's own p95 level. High = dense/busy (little
+    black) -> faster base; low = sparse (much black) -> slower base."""
+    import librosa
+
+    S = np.abs(librosa.stft(y, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr)
+    Sw = librosa.perceptual_weighting(S, freqs)  # dB, de-emphasizes inaudible LF
+    p95 = float(np.percentile(Sw, 95))
+    return float((Sw > (p95 - 30.0)).mean())
+
+
+def _felt_locked_cut_indices(
+    n: int,
+    intense_mask: np.ndarray,
+    slow_mask: np.ndarray,
+    ambient_mask: np.ndarray,
+    sub: float,
+    intense_mult: float,
+    slow_mult: float,
+    parity: int,
+    bar_felt_beats: int = 4,
+    intense_every_beat: bool = False,
+) -> list[int]:
+    """Beat indices to cut on, felt-locked with a SALIENCE-QUANTIZED constant
+    felt-beat gap per tier. Cuts only land on the felt-downbeat parity
+    (`parity`), and within any tier the gap is a fixed whole number of felt
+    beats — but the gap is now snapped so it can't rotate the cut through the
+    weak beats of the bar (the owner's "1,2,1,2" complaint):
+
+      * intense -> every felt beat (gap 1); dense weak landings are the point.
+        When `intense_every_beat` (the kick sits on EVERY detected beat, not just
+        the felt/parity ones — a driving four-on-floor track), intense instead
+        cuts on every detected beat: one flip per kick, the owner's ask. Doubled
+        tracks (kick only on parity beats) leave this off and stay every-felt.
+      * normal  -> nearest EVEN felt-beat gap (>=2); an even gap has gcd>=2 with
+        the 4-beat bar, so cuts stay on the {beat 1, beat 3} strong/medium
+        subgroup instead of walking onto 2 & 4.
+      * slow / ambient -> nearest BAR-MULTIPLE gap (>= one bar); a bar-multiple
+        gap lands on the SAME bar position every cut (the downbeat, once
+        bar_phase anchors it), giving one clean cut per N bars.
+
+    The arithmetic (waveform-eng): with constant gap g and bar length b, cut
+    landings cycle through the subgroup generated by g mod b. gcd(g,b)=1 (an odd
+    gap on a 4-bar) rotates through EVERY position incl. the weak 2 & 4; even and
+    bar-multiple gaps keep gcd>1, so the cut position is stable. Pure and
+    deterministic; exercised by tests/test_felt_lock.py."""
+    bar = max(1, int(bar_felt_beats))
+
+    def _raw_felt_gap(mult: float) -> float:
+        if sub <= 0 or mult <= 0:
+            return 1.0
+        return 1.0 / (2.0 * sub * mult)
+
+    g_intense = 1
+    g_normal = max(2, int(round(_raw_felt_gap(1.0) / 2.0)) * 2)
+    g_slow = max(bar, int(round(_raw_felt_gap(slow_mult) / bar)) * bar)
+    # Guarantee the density ordering intense < normal < slow survives rounding
+    # (a coarse bar-snap can collapse slow onto normal on some grids).
+    if g_slow <= g_normal:
+        g_slow = ((g_normal // bar) + 1) * bar
+
+    felt_idx = -1
+    last_emit: int | None = None
+    idxs: list[int] = []
+    for k in range(n):
+        on_parity = (k % 2) == parity
+        if on_parity:
+            felt_idx += 1
+        # Intense on a track whose kick is on every beat: cut on every detected
+        # beat (parity AND off-parity) — one flip per kick.
+        if intense_mask[k] and intense_every_beat:
+            idxs.append(k)
+            if on_parity:
+                last_emit = felt_idx
+            continue
+        if not on_parity:
+            continue
+        if intense_mask[k]:
+            g = g_intense
+        elif slow_mask[k] or ambient_mask[k]:
+            g = g_slow
+        else:
+            g = g_normal
+        if last_emit is None or (felt_idx - last_emit) >= g:
+            idxs.append(k)
+            last_emit = felt_idx
+    return idxs
+
+
+def _drop_opening_flash(
+    transitions: list[tuple[float, str]],
+) -> list[tuple[float, str]]:
+    """Suppress an "out of the gate" cut. The timeline always starts a segment at
+    t=0, but the first real beat can land almost immediately (librosa's first
+    detected beat is often <1s in), so photo 1 would only flash before the actual
+    cadence begins. If that opening hold is much shorter than the next one (<half),
+    drop the first cut so photo 1 rides to the following cut — the owner would
+    rather the opening photo linger than see an instant flip. Pure; exercised by
+    tests/test_felt_lock.py."""
+    if len(transitions) >= 3 and transitions[0][0] < 1e-3:
+        lead = transitions[1][0] - transitions[0][0]
+        nxt = transitions[2][0] - transitions[1][0]
+        if nxt > 0 and lead < 0.5 * nxt:
+            return transitions[:1] + transitions[2:]
+    return transitions
+
+
+# --------------------------------------------------------------------------- #
+# Onset-anchored cuts for rubato / sparse sections
+#
+# On a sparse rubato passage (a solo piano intro, a breakdown) librosa's beat
+# grid is fiction: the tempo prior fills a flat onset autocorrelation, so the
+# metronome lands hundreds of ms off the actual note attacks. Below ~a dozen
+# events the EVENTS ARE THE PULSE — so in those spans we abandon the grid and
+# cut on the real onset strikes instead. Regime is decided per region by GRID
+# SUPPORT (fraction of felt beats with a prominent strike within 70ms); a span
+# scoring below _ONSET_ANCHOR_THRESH for at least _ONSET_ANCHOR_MIN_SPAN seconds
+# switches to onset-anchoring. The tier ladder transplants as photos-per-STRIKE
+# (the chord is the tactus): intense=every strike, normal=every 2nd, slow=every
+# 4th. Gaps between strikes LINGER — we never interpolate phantom beats.
+# (Design: audio-engineer consult, agent-chat 'audio' Part 5.)
+# --------------------------------------------------------------------------- #
+
+_GRID_SUPPORT_WINDOW_S = 0.070   # a felt beat "supports" the grid if a strike is this close
+_ONSET_ANCHOR_THRESH = 0.30      # grid support below this -> the grid is fiction here
+_ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
+# A song whose OVERALL grid support clears this is fundamentally grid-locked
+# (a driving four-on-floor track): local dips are breakdowns/filter sweeps that
+# still feel beat-driven, so we never onset-anchor them. Only songs that are
+# overall ambiguous/rubato (a ballad with a sparse intro) get per-section anchoring.
+_ONSET_ANCHOR_SONG_GATE = 0.65
+_STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
+# Photos per strike by tier. Strikes are already sparse (~2s apart in a rubato
+# intro), so ambient cuts every 2nd strike rather than every 4th — every-4th
+# would leave a >10s opening hold. slow stays deliberately sparse for a
+# breakdown; intense cuts every strike.
+_PHOTOS_PER_STRIKE = {"intense": 1, "normal": 2, "slow": 4, "ambient": 2}
+
+
+def _prominent_strikes(
+    y: np.ndarray, sr: int, *, prom_frac: float = 0.30, rolling_s: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Peak-picked onset attacks (the note/chord strikes), returned as
+    (times, heights). Height is read at the PEAK; a strike survives when it
+    exceeds prom_frac of the local-p90 envelope (drops ornaments, keeps chords).
+    Times are BACKTRACKED to the attack start so a cut on them reads on-the-hit.
+
+    NOT coalesced: this is the raw strike set used to MEASURE grid support, and
+    at a fast tempo (144 BPM = a beat every 0.42s) merging near-together strikes
+    would erase real consecutive kicks and make a grid track look rubato.
+    Coalescing a chord/grace pair happens only in the cut path (see
+    _coalesce_strikes), inside sparse onset-anchor spans."""
+    import librosa
+
+    env = librosa.onset.onset_strength(y=y, sr=sr)
+    peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, backtrack=False)
+    if len(peaks) == 0:
+        return np.array([]), np.array([])
+    back = librosa.onset.onset_backtrack(peaks, env)
+    hop = 512
+    w = max(1, int(rolling_s * sr / hop))
+    times, heights = [], []
+    for pk, bk in zip(peaks, back):
+        lo, hi = max(0, pk - w), min(len(env), pk + w)
+        p90 = float(np.percentile(env[lo:hi], 90))
+        h = float(env[min(pk, len(env) - 1)])
+        if h >= prom_frac * p90:
+            times.append(float(librosa.frames_to_time(bk, sr=sr)))
+            heights.append(h)
+    return np.asarray(times), np.asarray(heights)
+
+
+def _coalesce_strikes(
+    times: np.ndarray, heights: np.ndarray, min_gap: float = _STRIKE_COALESCE_S,
+) -> np.ndarray:
+    """Merge strikes closer than min_gap, keeping the louder of each pair, so an
+    every-strike tier can't double-cut a fast chord/grace pair. Applied only
+    inside onset-anchor spans, where strikes are already sparse."""
+    t = np.asarray(times, dtype=float)
+    if len(t) == 0:
+        return t
+    h = np.asarray(heights, dtype=float) if len(heights) else np.ones_like(t)
+    order = np.argsort(t)
+    t, h = t[order], h[order]
+    keep_t, keep_h = [t[0]], [h[0]]
+    for i in range(1, len(t)):
+        if t[i] - keep_t[-1] < min_gap:
+            if h[i] > keep_h[-1]:
+                keep_t[-1], keep_h[-1] = t[i], h[i]
+        else:
+            keep_t.append(t[i])
+            keep_h.append(h[i])
+    return np.asarray(keep_t)
+
+
+def _grid_support(felt_beats: np.ndarray, strikes: np.ndarray,
+                  window_s: float = _GRID_SUPPORT_WINDOW_S) -> float:
+    """Fraction of felt beats with a strike within +/- window_s. 1.0 = grid sits
+    on the music, ~0 = the grid is fiction (rubato / sparse)."""
+    if len(felt_beats) == 0 or len(strikes) == 0:
+        return 0.0
+    strikes = np.asarray(strikes)
+    hits = sum(1 for b in felt_beats if np.min(np.abs(strikes - b)) <= window_s)
+    return hits / len(felt_beats)
+
+
+def _kick_on_every_beat(
+    y: np.ndarray, sr: int, beat_times: np.ndarray, *,
+    band: tuple[float, float] = (30.0, 150.0), thresh: float = 0.60,
+) -> bool:
+    """True when the KICK sits on every detected beat (a driving four-on-floor
+    track), so intense should cut once per kick. Two octave-proofing measures
+    (audio-engineer consult), both needed:
+
+      (a) band-limit to the kick band (~30-150 Hz): hats / shakers / guitar chugs
+          that also land every beat vanish, so we measure the KICK, not just
+          "onset energy on every beat".
+      (b) gate on min(even-parity, odd-parity) support, not the pooled mean: a
+          DOUBLED track whose kick is only on the felt (parity) beats reads ~1.0
+          on the strong side and ~0 on the weak side, so the min collapses;
+          genuine every-beat kicks read high on both. (NOT the accent-alternation
+          test — that detects meter, not octave, and misfires on Push.)"""
+    import librosa
+
+    bt = np.asarray(beat_times, dtype=float)
+    if len(bt) < 4:
+        return False
+    S = np.abs(librosa.stft(y)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr)
+    band_S = S[(freqs >= band[0]) & (freqs <= band[1]), :]
+    if band_S.shape[0] == 0:
+        return False
+    env = librosa.onset.onset_strength(S=librosa.power_to_db(band_S + 1e-10), sr=sr)
+    peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, backtrack=False)
+    strikes = librosa.frames_to_time(peaks, sr=sr)
+    if len(strikes) == 0:
+        return False
+    even = _grid_support(bt[0::2], strikes)
+    odd = _grid_support(bt[1::2], strikes)
+    return min(even, odd) >= thresh
+
+
+def _onset_anchor_spans(
+    felt_beats: np.ndarray, strikes: np.ndarray, duration: float, *,
+    thresh: float = _ONSET_ANCHOR_THRESH, min_span_s: float = _ONSET_ANCHOR_MIN_SPAN,
+    win_s: float = 8.0, step_s: float = 2.0,
+) -> list[tuple[float, float]]:
+    """Time spans where the beat grid is fiction and cuts should follow strikes.
+    Slides a window computing grid support, keeps runs below `thresh`, and returns
+    those lasting at least `min_span_s` (so the regime can't flap segment to
+    segment). Pure; exercised by tests/test_onset_anchor.py."""
+    felt_beats = np.asarray(felt_beats, dtype=float)
+    if duration <= 0 or len(felt_beats) == 0:
+        return []
+    centers, low = [], []
+    t = 0.0
+    while t < duration:
+        fb = felt_beats[(felt_beats >= t) & (felt_beats < t + win_s)]
+        centers.append(t + win_s / 2.0)
+        low.append(len(fb) > 0 and _grid_support(fb, strikes) < thresh)
+        t += step_s
+    # Merge consecutive low windows into spans (bridge the window overlap).
+    spans: list[tuple[float, float]] = []
+    i = 0
+    while i < len(low):
+        if low[i]:
+            j = i
+            while j + 1 < len(low) and low[j + 1]:
+                j += 1
+            t0 = max(0.0, centers[i] - win_s / 2.0)
+            t1 = min(duration, centers[j] + win_s / 2.0)
+            if t1 - t0 >= min_span_s:
+                spans.append((t0, t1))
+            i = j + 1
+        else:
+            i += 1
+    return spans
+
+
+def _onset_anchor_cuts(
+    span: tuple[float, float], strikes: np.ndarray,
+    tier_at: callable, ambient_default: str = "slow",
+) -> list[tuple[float, str]]:
+    """Cut times inside an onset-anchor span: emit on prominent strikes at the
+    tier's photos-per-strike cadence (intense=every strike, normal=every 2nd,
+    slow/ambient=every 4th). Strike gaps LINGER (no phantom beats). Pure;
+    exercised by tests/test_onset_anchor.py."""
+    t0, t1 = span
+    sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    out: list[tuple[float, str]] = []
+    i = 0
+    while i < len(sel):
+        tier = tier_at(sel[i]) or ambient_default
+        out.append((sel[i], tier))
+        step = _PHOTOS_PER_STRIKE.get(tier, 2)
+        i += max(1, step)
+    return out
+
+
+def _splice_onset_anchor(
+    transitions: list[tuple[float, str]],
+    spans: list[tuple[float, float]],
+    strikes: np.ndarray,
+    tier_at: callable,
+    heights: np.ndarray | None = None,
+) -> list[tuple[float, str]]:
+    """Replace grid transitions inside onset-anchor spans with strike-anchored
+    cuts, leaving grid spans untouched. Strikes are coalesced PER SPAN (a fast
+    chord/grace pair collapses to its louder hit) before the pace mapping. Pure;
+    exercised by tests."""
+    if not spans:
+        return transitions
+    strikes = np.asarray(strikes, dtype=float)
+    heights = np.asarray(heights, dtype=float) if heights is not None else np.ones_like(strikes)
+
+    def _in_span(t: float) -> bool:
+        return any(t0 <= t < t1 for t0, t1 in spans)
+
+    kept = [(t, k) for (t, k) in transitions if not _in_span(t)]
+    for span in spans:
+        t0, t1 = span
+        m = (strikes >= t0 - 1e-6) & (strikes < t1 + 1e-6)
+        span_strikes = _coalesce_strikes(strikes[m], heights[m])
+        kept.extend(_onset_anchor_cuts(span, span_strikes, tier_at))
+    kept.sort(key=lambda tk: tk[0])
+    return kept
+
+
+def _occupancy_base_subdivision(
+    y: np.ndarray, sr: int, beat_times: np.ndarray
+) -> tuple[float | None, float, float]:
+    """Return (subdivision photos-per-beat, occupancy, actual photos/sec) for the
+    normal tier, octave-free. subdivision is None if the grid is unusable."""
+    bt = np.asarray(beat_times, dtype=float)
+    ibi = np.diff(bt)
+    if len(ibi) == 0:
+        return None, 0.0, 0.0
+    bps = 1.0 / float(np.median(ibi))  # fine-grid beats/sec from IBIs, not the scalar
+    occ = _spectral_occupancy(y, sr)
+    target = next(t for edge, t in _OCCUPANCY_PACE_LADDER if occ < edge)
+    beats_per_photo = max(2, int(round((bps / target) / 2.0) * 2))  # nearest EVEN
+    actual_pps = float(np.clip(bps / beats_per_photo, *_NORMAL_PPS_CLAMP))
+    return 1.0 / beats_per_photo, occ, actual_pps
+
+
 def _pick_subdivision(
     bpm: float,
     max_pps: float,
@@ -921,6 +1320,259 @@ def _summarize_per_month(
     return [(f"{k[0]}-{k[1]:02d}", v[0], v[1]) for k, v in by_month.items()]
 
 
+# --- Viterbi pacing model (experimental alternative to _classify_regions +
+#     _pick_top_sections) ---------------------------------------------------
+#
+# Motivation (issue #43): the shipping tier map over-labels "ambient" because
+# it gates on max-normalized ONSET STRENGTH (an event/attack detector), so a
+# loud-but-steady passage reads as "no beat." This model instead builds a
+# per-beat ENERGY signal from RMS loudness + onset rate, then labels the whole
+# timeline with Viterbi (one switch-penalty knob) so tiers come out contiguous
+# — no per-beat chatter, no per-genre parameters. Tiers stay per-song relative
+# (a quiet song still gets its own loudest moment as "intense"), per intent #4.
+_PACE_TIERS = ("ambient", "slow", "normal", "intense")
+
+
+def _pace_robust_norm(x: np.ndarray) -> np.ndarray:
+    """Min-max to [0,1] using 5th/95th pct as the range (silence-robust)."""
+    if len(x) == 0:
+        return x
+    lo, hi = np.percentile(x, 5), np.percentile(x, 95)
+    if hi - lo < 1e-9:
+        return np.zeros_like(x)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _pace_moving_median(x: np.ndarray, win: int) -> np.ndarray:
+    """Odd-window edge-padded moving median — smooth the CONTINUOUS energy so
+    tiers come out contiguous (vs. smoothing labels, which cascades)."""
+    if win <= 1 or len(x) == 0:
+        return x
+    if win % 2 == 0:
+        win += 1
+    r = win // 2
+    pad = np.pad(x, r, mode="edge")
+    return np.array([np.median(pad[i : i + win]) for i in range(len(x))])
+
+
+# --------------------------------------------------------------------------- #
+# Segment-first pacing model ("segment"): Foote novelty on stacked beat-synced
+# features cuts the song into sections, then each SECTION is scored by its
+# cyan-height (p90 spectral-centroid envelope) and labelled against mode-anchored
+# tier centers. Boundaries land on beats by construction, so tier changes are
+# crisp; scoring a whole section by its interior median avoids the per-beat
+# chatter the height signal alone would produce. Developed in
+# experiments/pacing_recipes.py (recipe_c); see docs there for the derivation.
+# --------------------------------------------------------------------------- #
+def _pace_beat_agg(arr: np.ndarray, beat_frames: np.ndarray, agg=np.mean) -> np.ndarray:
+    """Aggregate a per-frame feature over each beat's window [beat_i, beat_i+1).
+    Window stat (not point-sample) so a bursty beat reflects its bursts."""
+    n = len(beat_frames)
+    out = np.zeros(n)
+    for i in range(n):
+        lo = int(beat_frames[i])
+        hi = int(beat_frames[i + 1]) if i + 1 < n else len(arr)
+        out[i] = agg(arr[lo:hi]) if hi > lo else arr[min(lo, len(arr) - 1)]
+    return out
+
+
+def _pace_beat_smooth(x: np.ndarray, w: int = 8) -> np.ndarray:
+    """Centered moving mean over ~w beats (1-D or per-column for 2-D)."""
+    from scipy.ndimage import uniform_filter1d
+
+    if x.ndim == 1:
+        return uniform_filter1d(x, w, mode="nearest")
+    return np.column_stack(
+        [uniform_filter1d(x[:, k], w, mode="nearest") for k in range(x.shape[1])]
+    )
+
+
+def _pace_foote_novelty(ssm: np.ndarray, kernel_size: int) -> np.ndarray:
+    """Foote checkerboard novelty along the diagonal of a self-similarity matrix."""
+    L = kernel_size
+    g = np.linspace(-1.0, 1.0, 2 * L)
+    gauss = np.outer(np.exp(-4.0 * g**2), np.exp(-4.0 * g**2))
+    sign = np.outer(np.sign(g), np.sign(g))
+    kernel = gauss * sign
+    n = ssm.shape[0]
+    nov = np.zeros(n)
+    for i in range(n):
+        a, b = i - L, i + L
+        pa, pb = max(0, a), min(n, b)
+        ka, kb = pa - a, 2 * L - (b - pb)
+        nov[i] = float((ssm[pa:pb, pa:pb] * kernel[ka:kb, ka:kb]).sum())
+    nov = np.maximum(nov, 0.0)
+    if nov.max() > 0:
+        nov = nov / nov.max()
+    return nov
+
+
+def _pace_mode_anchored_centers(vals: np.ndarray) -> np.ndarray:
+    """Tier centers anchored at the BASELINE (mode = the groove the song sits at
+    most often), with asymmetric up/down spread. The median is dragged up by
+    peaks and pushes the baseline into 'slow'; the mode stays put. Not clipped to
+    [0,1]: `combined` ranges past 1.0, and clipping crushed normal/intense
+    together on tracks whose typical section already sits high, erasing intense."""
+    lo, hi = float(np.percentile(vals, 5)), float(np.percentile(vals, 95))
+    hist, edges = np.histogram(vals, bins=20, range=(vals.min(), vals.max() + 1e-9))
+    mode = 0.5 * (edges[hist.argmax()] + edges[hist.argmax() + 1])
+    up = max(hi - mode, 0.05)
+    dn = max(mode - lo, 0.05)
+    return np.maximum(
+        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0
+    )
+
+
+def _pace_rolling_p80(x: np.ndarray, win: int = 16) -> np.ndarray:
+    """p80 of x in a centered ~win-beat window at every beat — used to calibrate
+    tier centers on the SAME statistic sections are scored with (p80). Fitting
+    centers on raw per-beat values is a statistic mismatch: p80 is upward-biased,
+    so on burst-texture tracks the per-beat mode sits among gap beats and every
+    section's p80 rides above it, making slow/ambient unreachable. See
+    experiments/pacing_recipes.py _rolling_p80."""
+    n = len(x)
+    if n == 0:
+        return x
+    r = win // 2
+    out = np.zeros(n)
+    for i in range(n):
+        a, b = max(0, i - r), min(n, i + r + 1)
+        out[i] = np.percentile(x[a:b], 80)
+    return out
+
+
+def _pace_tiers_segment(
+    audio_path: Path,
+    beat_times: np.ndarray,
+    bpm: float,
+    *,
+    kernel_beats: int = 16,
+    min_seg_beats: int = 16,
+    prominence: float = 0.12,
+    depth_boost: float = 0.6,
+) -> list[str]:
+    """Per-beat pacing tiers via the segment-first cyan-height model (recipe C).
+
+    1. Beat-synced texture features (log-centroid p90 = cyan height, log-RMS,
+       MFCC, modulation depth) -> cosine SSM -> Foote novelty -> segment cuts.
+    2. Per-beat energy = cyan height + variance-gated loudness booster, plus a
+       modulation-depth boost that rescues burst trains (median energy sits in
+       the gaps; depth is high there).
+    3. Mode-anchored tier centers over the per-beat combined signal; each SEGMENT
+       labelled by the nearest center to its median.
+    """
+    import librosa
+
+    if len(beat_times) < 8:
+        return ["ambient"] * len(beat_times)
+
+    y, sr = librosa.load(str(audio_path), mono=True)
+    hop = 512
+    bf = np.clip(np.asarray(librosa.time_to_frames(beat_times, sr=sr, hop_length=hop), dtype=int), 0, None)
+
+    cent = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
+    logcent = np.log2(np.maximum(cent, 1e-6))
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-6))
+    logrms = np.log(np.maximum(rms, 1e-6))
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop, n_mfcc=13)
+
+    def p90(a):
+        return float(np.percentile(a, 90)) if len(a) else 0.0
+    height_raw = _pace_beat_agg(logcent, bf, agg=p90)        # per-beat cyan height
+    lrms_beat = _pace_beat_agg(logrms, bf)
+    loud_beat = _pace_beat_agg(rms_db, bf)
+    mfcc_beat = np.column_stack([_pace_beat_agg(mfcc[k], bf) for k in range(mfcc.shape[0])])
+
+    # modulation depth: p90-p10 of raw height over ~16 beats (burst-train marker)
+    n = len(height_raw)
+    moddepth = np.zeros(n)
+    for i in range(n):
+        a, b = max(0, i - 8), min(n, i + 9)
+        wnd = height_raw[a:b]
+        moddepth[i] = np.percentile(wnd, 90) - np.percentile(wnd, 10) if len(wnd) else 0.0
+
+    # per-beat energy: cyan height + one-way, variance-gated loudness booster
+    height_n = _pace_robust_norm(height_raw)
+    loud_n = _pace_robust_norm(loud_beat)
+    iqr_db = float(np.percentile(loud_beat, 75) - np.percentile(loud_beat, 25))
+    w_loud = float(np.clip((iqr_db - 3.0) / 6.0, 0.0, 1.0))
+    energy = (height_n + w_loud * loud_n) / (1.0 + w_loud)
+    combined = energy + depth_boost * _pace_robust_norm(moddepth)
+
+    # segment boundaries: Foote novelty on TEXTURE-WINDOWED stacked features
+    if n < 2 * kernel_beats:
+        bounds = [0]
+    else:
+        level = _pace_beat_smooth(np.column_stack([mfcc_beat, lrms_beat, height_raw]), 8)
+        feat = np.column_stack([level, moddepth])
+        feat = (feat - feat.mean(0)) / (feat.std(0) + 1e-9)
+        fn = feat / np.maximum(np.linalg.norm(feat, axis=1, keepdims=True), 1e-9)
+        ssm = fn @ fn.T
+        kb = min(kernel_beats, n // 2) or 1
+        nov = _pace_foote_novelty(ssm, kb)
+        from scipy.signal import find_peaks
+
+        peaks, _ = find_peaks(nov, prominence=prominence, distance=max(min_seg_beats, kb))
+        bounds = sorted(set([0] + [int(p) for p in peaks]))
+
+    seg_edges = list(zip(bounds, bounds[1:] + [n]))
+    # Calibrate centers on the section-scale statistic (rolling-p80), matching the
+    # p80 segment scores, so slow/ambient are reachable on burst-texture tracks.
+    centers = _pace_mode_anchored_centers(_pace_rolling_p80(combined, 16))
+    tiers = ["normal"] * n
+    for s0, s1 in seg_edges:
+        if s1 <= s0:
+            continue
+        # Score by p80 ("how bright does this section GET"), not median: rewards a
+        # segment that spikes even if calm on average, and doubles as a duty-cycle
+        # floor for burst trains. See experiments/pacing_recipes.py recipe_c.
+        score = float(np.percentile(combined[s0:s1], 80))
+        tier = _PACE_TIERS[int(np.argmin((score - centers) ** 2))]
+        for i in range(s0, s1):
+            tiers[i] = tier
+    return tiers
+
+
+def _pace_tiers_to_regions(
+    tiers: list[str], beat_times: np.ndarray, audio_duration: float
+) -> tuple[
+    list[tuple[float, float]], list[tuple[float, float]],
+    list[tuple[float, float]], list[tuple[float, float]],
+    np.ndarray, np.ndarray,
+]:
+    """Convert per-beat tiers into the (intense, slow, ambient, beat/normal)
+    regions + per-beat intense/slow masks the renderer consumes. Regions tile
+    [0, audio_duration] with no gaps (each run spans to the next run's start)."""
+    n = len(beat_times)
+    intense: list[tuple[float, float]] = []
+    slow: list[tuple[float, float]] = []
+    ambient: list[tuple[float, float]] = []
+    beat: list[tuple[float, float]] = []
+    intense_mask = np.zeros(n, dtype=bool)
+    slow_mask = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and tiers[j + 1] == tiers[i]:
+            j += 1
+        a = 0.0 if i == 0 else float(beat_times[i])
+        b = float(beat_times[j + 1]) if j + 1 < n else audio_duration
+        t = tiers[i]
+        if t == "intense":
+            intense.append((a, b))
+            intense_mask[i : j + 1] = True
+        elif t == "slow":
+            slow.append((a, b))
+            slow_mask[i : j + 1] = True
+        elif t == "ambient":
+            ambient.append((a, b))
+        else:
+            beat.append((a, b))
+        i = j + 1
+    return intense, slow, ambient, beat, intense_mask, slow_mask
+
+
 def build_timeline(
     audio_path: Path,
     photo_dates: list[datetime],
@@ -940,10 +1592,17 @@ def build_timeline(
     min_normal_bridge_beats: float = 8.0,
     snap_to_grid: bool = True,
     tier_lead_seconds: float = 0.0,
+    pace_model: str = "segment",
+    base_pace: str = "occupancy",
+    onset_anchor: str = "auto",
+    intense_per_kick: str = "auto",
 ) -> BeatTimeline:
     """Build a beat-aligned timeline matching photos to transition times.
 
     photo_dates: dates for the *kept* photos (post-alignment), in order.
+    pace_model: "segment" (Foote-segmented cyan-height, per-section scored — the
+      shipped model) drives the tiers; any other value falls back to the quantile
+      top-N section picker.
     """
     n_photos = len(photo_dates)
     beat_times, strengths, loudness, loudness_anticausal, bpm, audio_duration = _detect_beats(
@@ -953,6 +1612,45 @@ def build_timeline(
     beat_regions, ambient_regions = _classify_regions(
         beat_times, strengths, audio_duration, beat_thresh
     )
+
+    # Occupancy base pace: set the normal-tier subdivision from the song's own
+    # spectral density (octave-free, from median-IBI), overriding the photo-count
+    # driven subdivision. An explicit --beat-speed still wins over this.
+    cut_felt_parity: int | None = None
+    onset_strikes: np.ndarray = np.array([])
+    onset_strike_heights: np.ndarray = np.array([])
+    onset_anchor_spans_final: list[tuple[float, float]] = []
+    intense_every_beat: bool = False
+    if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
+        import librosa
+
+        y_occ, sr_occ = librosa.load(str(audio_path), mono=True)
+        occ_sub, _occ, _pps = _occupancy_base_subdivision(y_occ, sr_occ, beat_times)
+        if occ_sub is not None:
+            beat_speed = occ_sub
+            # Felt-downbeat parity: on a doubled grid the true pulse is every
+            # OTHER beat; the stronger-onset parity (four-on-floor kick / ballad
+            # chord) is the "1 & 2". Snapping cuts to it keeps every flip on the
+            # felt pulse across tier boundaries, instead of odd tier spacings
+            # (e.g. intense every 3 beats) drifting cuts onto the off-beat.
+            s = np.asarray(strengths, dtype=float)
+            if len(s) > 3:
+                cut_felt_parity = 0 if s[0::2].mean() >= s[1::2].mean() else 1
+        # Peak-picked note attacks, for onset-anchoring sparse/rubato spans where
+        # the beat grid is fiction (see _prominent_strikes / _onset_anchor_spans).
+        if onset_anchor != "never":
+            onset_strikes, onset_strike_heights = _prominent_strikes(y_occ, sr_occ)
+        # Does the kick sit on EVERY detected beat (a driving four-on-floor track),
+        # not just the felt/parity ones? If so, intense cuts once per kick (every
+        # detected beat) instead of every 2nd — the owner's "1 cut per kick".
+        # Kick-band + min-parity, so an eighth-note-hat doubled track can't fake it.
+        # --intense-per-kick on|off overrides the auto detection per song.
+        if intense_per_kick == "on":
+            intense_every_beat = True
+        elif intense_per_kick == "off":
+            intense_every_beat = False
+        elif len(beat_times) > 3:
+            intense_every_beat = _kick_on_every_beat(y_occ, sr_occ, beat_times)
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
@@ -1040,6 +1738,22 @@ def build_timeline(
         # An extended slow region might now overlap an intense one — intense wins.
         slow_mask &= ~intense_mask
 
+    # Model-driven pacing ("segment"): replace the region set computed above with
+    # per-beat tiers from the Foote-segmented cyan-height model (recipe C).
+    # Overwrites rather than branches so all downstream transition/segment logic
+    # is shared. The quantile _pick_top_sections result above stays as the
+    # fallback when the model can't run (no beats / --no-vary-pace).
+    if pace_model == "segment" and vary_pace and len(beat_times) > 0:
+        tiers = _pace_tiers_segment(audio_path, beat_times, bpm)
+        (intense_regions, slow_regions, ambient_regions, beat_regions,
+         intense_mask, slow_mask) = _pace_tiers_to_regions(tiers, beat_times, audio_duration)
+        eff_intense_mult = intense_multiplier
+        eff_slow_mult = slow_multiplier
+        if snap_to_grid:
+            grid = (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16)
+            eff_intense_mult = min(grid, key=lambda g: abs(g - eff_intense_mult) / eff_intense_mult)
+            eff_slow_mult = min(grid, key=lambda g: abs(g - eff_slow_mult) / eff_slow_mult)
+
     def _ambient_subregions(region: tuple[float, float]) -> list[tuple[tuple[float, float], float]]:
         """Slice an ambient region into sub-spans tagged with their tier
         multiplier, so a slow/intense overlay extends through ambient too."""
@@ -1104,6 +1818,21 @@ def build_timeline(
             beat_is_ambient |= (beat_times >= a - 1e-6) & (beat_times <= b + 1e-6)
 
         n = len(beat_times)
+
+        if cut_felt_parity is not None:
+            # Occupancy felt-lock: cuts on the felt-downbeat parity at a CONSTANT
+            # integer felt-beat gap per tier (no 1/2-beat alternation). Uses the
+            # RAW tier multipliers so contrast stays wide. See _felt_locked_cut_
+            # indices + tests/test_felt_lock.py.
+            for k in _felt_locked_cut_indices(
+                n, intense_mask, slow_mask, beat_is_ambient, sub,
+                intense_multiplier, slow_multiplier, cut_felt_parity,
+                intense_every_beat=intense_every_beat,
+            ):
+                t = float(beat_times[k])
+                out.append((t, _kind_at(t)))
+            return out
+
         phase = 0.0
         for k in range(n):
             if intense_mask[k]:
@@ -1235,6 +1964,46 @@ def build_timeline(
         for t in reversed(pre_roll):
             transitions.insert(0, (float(t), "ambient"))
 
+    # Onset-anchor: in sparse/rubato spans the beat grid is fiction, so replace
+    # its cuts with cuts on the real note strikes (the events ARE the pulse there).
+    if onset_anchor != "never" and len(onset_strikes) > 0:
+        felt_for_support = (
+            beat_times[cut_felt_parity::2] if cut_felt_parity is not None else beat_times
+        )
+        if onset_anchor == "always":
+            anchor_spans = [(0.0, audio_duration)]
+        elif _grid_support(felt_for_support, onset_strikes) >= _ONSET_ANCHOR_SONG_GATE:
+            # Overall grid-locked (e.g. four-on-floor): trust the grid everywhere,
+            # even through breakdowns. Local dips aren't rubato, they're arrangement.
+            anchor_spans = []
+        else:
+            anchor_spans = _onset_anchor_spans(
+                felt_for_support, onset_strikes, audio_duration
+            )
+
+        def _tier_at_time(t: float) -> str:
+            for a, b in intense_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "intense"
+            for a, b in slow_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "slow"
+            for a, b in ambient_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "ambient"
+            return "normal"
+
+        transitions = _splice_onset_anchor(
+            transitions, anchor_spans, onset_strikes, _tier_at_time, onset_strike_heights
+        )
+        onset_anchor_spans_final = anchor_spans
+        # The splice may have removed the t=0 start (it sits inside the intro
+        # span); restore it so the timeline still opens at audio time 0.
+        if transitions and transitions[0][0] > 1e-3:
+            transitions.insert(0, (0.0, transitions[0][1]))
+
+    transitions = _drop_opening_flash(transitions)
+
     # Compute durations: each transition's duration is the gap to the next,
     # with the final segment running to audio_duration.
     times = [t for t, _ in transitions]
@@ -1310,4 +2079,6 @@ def build_timeline(
         intense_multiplier=eff_intense_mult,
         slow_multiplier=eff_slow_mult,
         beat_times=[float(t) for t in beat_times],
+        onset_anchor_spans=onset_anchor_spans_final,
+        onset_strikes=[float(t) for t in onset_strikes],
     )
