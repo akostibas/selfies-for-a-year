@@ -658,6 +658,11 @@ def _drop_opening_flash(
 _GRID_SUPPORT_WINDOW_S = 0.070   # a felt beat "supports" the grid if a strike is this close
 _ONSET_ANCHOR_THRESH = 0.30      # grid support below this -> the grid is fiction here
 _ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
+# A song whose OVERALL grid support clears this is fundamentally grid-locked
+# (a driving four-on-floor track): local dips are breakdowns/filter sweeps that
+# still feel beat-driven, so we never onset-anchor them. Only songs that are
+# overall ambiguous/rubato (a ballad with a sparse intro) get per-section anchoring.
+_ONSET_ANCHOR_SONG_GATE = 0.65
 _STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
 # Photos per strike by tier. Strikes are already sparse (~2s apart in a rubato
 # intro), so ambient cuts every 2nd strike rather than every 4th — every-4th
@@ -673,8 +678,12 @@ def _prominent_strikes(
     (times, heights). Height is read at the PEAK; a strike survives when it
     exceeds prom_frac of the local-p90 envelope (drops ornaments, keeps chords).
     Times are BACKTRACKED to the attack start so a cut on them reads on-the-hit.
-    Strikes closer than _STRIKE_COALESCE_S are merged, keeping the louder — so an
-    every-strike tier can't double-cut a fast chord pair."""
+
+    NOT coalesced: this is the raw strike set used to MEASURE grid support, and
+    at a fast tempo (144 BPM = a beat every 0.42s) merging near-together strikes
+    would erase real consecutive kicks and make a grid track look rubato.
+    Coalescing a chord/grace pair happens only in the cut path (see
+    _coalesce_strikes), inside sparse onset-anchor spans."""
     import librosa
 
     env = librosa.onset.onset_strength(y=y, sr=sr)
@@ -692,19 +701,29 @@ def _prominent_strikes(
         if h >= prom_frac * p90:
             times.append(float(librosa.frames_to_time(bk, sr=sr)))
             heights.append(h)
-    if not times:
-        return np.array([]), np.array([])
-    # Coalesce near-simultaneous strikes, keeping the louder of each pair.
-    t = np.asarray(times); h = np.asarray(heights)
-    order = np.argsort(t); t, h = t[order], h[order]
+    return np.asarray(times), np.asarray(heights)
+
+
+def _coalesce_strikes(
+    times: np.ndarray, heights: np.ndarray, min_gap: float = _STRIKE_COALESCE_S,
+) -> np.ndarray:
+    """Merge strikes closer than min_gap, keeping the louder of each pair, so an
+    every-strike tier can't double-cut a fast chord/grace pair. Applied only
+    inside onset-anchor spans, where strikes are already sparse."""
+    t = np.asarray(times, dtype=float)
+    if len(t) == 0:
+        return t
+    h = np.asarray(heights, dtype=float) if len(heights) else np.ones_like(t)
+    order = np.argsort(t)
+    t, h = t[order], h[order]
     keep_t, keep_h = [t[0]], [h[0]]
     for i in range(1, len(t)):
-        if t[i] - keep_t[-1] < _STRIKE_COALESCE_S:
+        if t[i] - keep_t[-1] < min_gap:
             if h[i] > keep_h[-1]:
                 keep_t[-1], keep_h[-1] = t[i], h[i]
         else:
             keep_t.append(t[i]); keep_h.append(h[i])
-    return np.asarray(keep_t), np.asarray(keep_h)
+    return np.asarray(keep_t)
 
 
 def _grid_support(felt_beats: np.ndarray, strikes: np.ndarray,
@@ -780,16 +799,26 @@ def _splice_onset_anchor(
     spans: list[tuple[float, float]],
     strikes: np.ndarray,
     tier_at: "callable",
+    heights: np.ndarray | None = None,
 ) -> list[tuple[float, str]]:
     """Replace grid transitions inside onset-anchor spans with strike-anchored
-    cuts, leaving grid spans untouched. Pure; exercised by tests."""
+    cuts, leaving grid spans untouched. Strikes are coalesced PER SPAN (a fast
+    chord/grace pair collapses to its louder hit) before the pace mapping. Pure;
+    exercised by tests."""
     if not spans:
         return transitions
+    strikes = np.asarray(strikes, dtype=float)
+    heights = np.asarray(heights, dtype=float) if heights is not None else np.ones_like(strikes)
+
     def _in_span(t: float) -> bool:
         return any(t0 <= t < t1 for t0, t1 in spans)
+
     kept = [(t, k) for (t, k) in transitions if not _in_span(t)]
     for span in spans:
-        kept.extend(_onset_anchor_cuts(span, strikes, tier_at))
+        t0, t1 = span
+        m = (strikes >= t0 - 1e-6) & (strikes < t1 + 1e-6)
+        span_strikes = _coalesce_strikes(strikes[m], heights[m])
+        kept.extend(_onset_anchor_cuts(span, span_strikes, tier_at))
     kept.sort(key=lambda tk: tk[0])
     return kept
 
@@ -1639,6 +1668,7 @@ def build_timeline(
     # driven subdivision. An explicit --beat-speed still wins over this.
     cut_felt_parity: int | None = None
     onset_strikes: np.ndarray = np.array([])
+    onset_strike_heights: np.ndarray = np.array([])
     onset_anchor_spans_final: list[tuple[float, float]] = []
     if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
         import librosa
@@ -1658,7 +1688,7 @@ def build_timeline(
         # Peak-picked note attacks, for onset-anchoring sparse/rubato spans where
         # the beat grid is fiction (see _prominent_strikes / _onset_anchor_spans).
         if onset_anchor != "never":
-            onset_strikes, _ = _prominent_strikes(y_occ, sr_occ)
+            onset_strikes, onset_strike_heights = _prominent_strikes(y_occ, sr_occ)
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
@@ -1982,6 +2012,10 @@ def build_timeline(
         )
         if onset_anchor == "always":
             anchor_spans = [(0.0, audio_duration)]
+        elif _grid_support(felt_for_support, onset_strikes) >= _ONSET_ANCHOR_SONG_GATE:
+            # Overall grid-locked (e.g. four-on-floor): trust the grid everywhere,
+            # even through breakdowns. Local dips aren't rubato, they're arrangement.
+            anchor_spans = []
         else:
             anchor_spans = _onset_anchor_spans(
                 felt_for_support, onset_strikes, audio_duration
@@ -2000,7 +2034,7 @@ def build_timeline(
             return "normal"
 
         transitions = _splice_onset_anchor(
-            transitions, anchor_spans, onset_strikes, _tier_at_time
+            transitions, anchor_spans, onset_strikes, _tier_at_time, onset_strike_heights
         )
         onset_anchor_spans_final = anchor_spans
         # The splice may have removed the t=0 start (it sits inside the intro
