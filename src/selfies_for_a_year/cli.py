@@ -905,6 +905,7 @@ def compile(
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
     pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections), 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled), or 'segment' (Foote-segmented cyan-height, per-section scored; best structural alignment). 'viterbi'/'segment' imply --vary-pace.")] = "current",
     base_pace: Annotated[str, typer.Option(help="[--beat-sync] Base (normal-tier) photo density: 'current' (packs to fit the photo set) or 'occupancy' (matches the song's spectral density — sparse songs linger, dense songs drive; subsets photos to hold the pace). Octave-free; overridden by --beat-speed.")] = "current",
+    onset_anchor: Annotated[str, typer.Option(help="[--base-pace occupancy] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
     preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
@@ -999,6 +1000,9 @@ def compile(
         raise typer.Exit(1)
     if base_pace not in ("current", "occupancy"):
         typer.echo(f"Error: --base-pace must be 'current' or 'occupancy', got '{base_pace}'.", err=True)
+        raise typer.Exit(1)
+    if onset_anchor not in ("auto", "never", "always"):
+        typer.echo(f"Error: --onset-anchor must be 'auto', 'never', or 'always', got '{onset_anchor}'.", err=True)
         raise typer.Exit(1)
     if pace_model in ("viterbi", "segment"):
         vary_pace = True  # model-driven tiers only mean something with multipliers
@@ -1231,6 +1235,7 @@ def compile(
             tier_lead_seconds=tier_lead_seconds,
             pace_model=pace_model,
             base_pace=base_pace,
+            onset_anchor=onset_anchor,
         )
         typer.echo(timeline.summary())
 
@@ -1312,7 +1317,9 @@ def compile(
         # any render using them must go through the constant-fps generator —
         # even hard-cut mode, which otherwise holds one frame per segment.
         per_frame_overlays = debug_progression_overlay or debug_metronome
-        metronome_beats = timeline.beat_times if debug_metronome else None
+        # In onset-anchor spans the dot flashes on the real note strikes, not the
+        # fictional grid — so the owner scores beat-match against what we cut on.
+        metronome_beats = timeline.metronome_times() if debug_metronome else None
 
         if beat_crossfade or per_frame_overlays:
             frames_iter, n_out = _beat_frames(

@@ -44,12 +44,22 @@ def main(argv):
     for s in tl.segments:
         cuts.append(t); t += s.duration
     cuts = np.array(cuts)
+    metro = np.asarray(tl.metronome_times())  # where the dot flashes (strikes in sparse spans)
+    spans = tl.onset_anchor_spans
 
     m = env_t <= win
     fig, ax = plt.subplots(figsize=(17, 4))
+    # shade onset-anchor spans (grid is fiction here -> we cut on strikes)
+    for a, b in spans:
+        if a < win:
+            ax.axvspan(a, min(b, win), color="gold", alpha=0.12)
     # onset envelope (piano strikes = peaks)
     ax.fill_between(env_t[m], 0, onset_env[m] / (onset_env[m].max() or 1),
                     color="0.75", label="onset strength (note attacks)")
+    # metronome dot flash times (should sit on strikes inside gold spans)
+    for mt in metro[metro <= win]:
+        ax.plot([mt], [1.22], marker="o", ms=5, color="black")
+    ax.plot([], [], marker="o", ms=5, color="black", ls="", label="metronome dot")
     # peak-picked onsets = the actual strikes
     for o in onsets:
         if o <= win:
@@ -70,7 +80,7 @@ def main(argv):
         ax.axvline(c, color="green", lw=1.4, ls="--", alpha=0.8)
     ax.plot([], [], color="green", lw=1.4, ls="--", label="scheduled CUT")
 
-    ax.set_xlim(0, win); ax.set_ylim(0, 1.25); ax.set_yticks([])
+    ax.set_xlim(0, win); ax.set_ylim(0, 1.3); ax.set_yticks([])
     ax.set_xlabel("time (s)")
     ax.set_title(f"{path.stem} — do the blue metronome beats sit on the orange strikes? "
                  f"(bpm~{60/np.median(np.diff(bt)):.0f}, felt~{60/np.median(np.diff(bt))/2:.0f})")

@@ -42,6 +42,23 @@ class BeatTimeline:
     intense_multiplier: float = 1.0
     slow_multiplier: float = 1.0
     beat_times: list[float] = field(default_factory=list)  # detected beat onsets, seconds
+    # Spans where the grid was fiction and cuts followed real note strikes.
+    onset_anchor_spans: list[tuple[float, float]] = field(default_factory=list)
+    onset_strikes: list[float] = field(default_factory=list)  # the strike times used there
+
+    def metronome_times(self) -> list[float]:
+        """Times the metronome dot should flash: detected beats where the grid
+        holds, but the real note STRIKES inside onset-anchor spans (so the dot
+        marks what we actually cut on, not a fictional grid)."""
+        if not self.onset_anchor_spans:
+            return list(self.beat_times)
+
+        def _in_span(t: float) -> bool:
+            return any(a <= t < b for a, b in self.onset_anchor_spans)
+
+        out = [t for t in self.beat_times if not _in_span(t)]
+        out += [t for t in self.onset_strikes if _in_span(t)]
+        return sorted(out)
 
     def _pacing_intervals(self) -> list[tuple[float, float, str]]:
         return _pacing_intervals_impl(
@@ -620,6 +637,161 @@ def _drop_opening_flash(
         if nxt > 0 and lead < 0.5 * nxt:
             return transitions[:1] + transitions[2:]
     return transitions
+
+
+# --------------------------------------------------------------------------- #
+# Onset-anchored cuts for rubato / sparse sections
+#
+# On a sparse rubato passage (a solo piano intro, a breakdown) librosa's beat
+# grid is fiction: the tempo prior fills a flat onset autocorrelation, so the
+# metronome lands hundreds of ms off the actual note attacks. Below ~a dozen
+# events the EVENTS ARE THE PULSE — so in those spans we abandon the grid and
+# cut on the real onset strikes instead. Regime is decided per region by GRID
+# SUPPORT (fraction of felt beats with a prominent strike within 70ms); a span
+# scoring below _ONSET_ANCHOR_THRESH for at least _ONSET_ANCHOR_MIN_SPAN seconds
+# switches to onset-anchoring. The tier ladder transplants as photos-per-STRIKE
+# (the chord is the tactus): intense=every strike, normal=every 2nd, slow=every
+# 4th. Gaps between strikes LINGER — we never interpolate phantom beats.
+# (Design: audio-engineer consult, agent-chat 'audio' Part 5.)
+# --------------------------------------------------------------------------- #
+
+_GRID_SUPPORT_WINDOW_S = 0.070   # a felt beat "supports" the grid if a strike is this close
+_ONSET_ANCHOR_THRESH = 0.30      # grid support below this -> the grid is fiction here
+_ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
+_STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
+# Photos per strike by tier. Strikes are already sparse (~2s apart in a rubato
+# intro), so ambient cuts every 2nd strike rather than every 4th — every-4th
+# would leave a >10s opening hold. slow stays deliberately sparse for a
+# breakdown; intense cuts every strike.
+_PHOTOS_PER_STRIKE = {"intense": 1, "normal": 2, "slow": 4, "ambient": 2}
+
+
+def _prominent_strikes(
+    y: np.ndarray, sr: int, *, prom_frac: float = 0.30, rolling_s: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Peak-picked onset attacks (the note/chord strikes), returned as
+    (times, heights). Height is read at the PEAK; a strike survives when it
+    exceeds prom_frac of the local-p90 envelope (drops ornaments, keeps chords).
+    Times are BACKTRACKED to the attack start so a cut on them reads on-the-hit.
+    Strikes closer than _STRIKE_COALESCE_S are merged, keeping the louder — so an
+    every-strike tier can't double-cut a fast chord pair."""
+    import librosa
+
+    env = librosa.onset.onset_strength(y=y, sr=sr)
+    peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, backtrack=False)
+    if len(peaks) == 0:
+        return np.array([]), np.array([])
+    back = librosa.onset.onset_backtrack(peaks, env)
+    hop = 512
+    w = max(1, int(rolling_s * sr / hop))
+    times, heights = [], []
+    for pk, bk in zip(peaks, back):
+        lo, hi = max(0, pk - w), min(len(env), pk + w)
+        p90 = float(np.percentile(env[lo:hi], 90))
+        h = float(env[min(pk, len(env) - 1)])
+        if h >= prom_frac * p90:
+            times.append(float(librosa.frames_to_time(bk, sr=sr)))
+            heights.append(h)
+    if not times:
+        return np.array([]), np.array([])
+    # Coalesce near-simultaneous strikes, keeping the louder of each pair.
+    t = np.asarray(times); h = np.asarray(heights)
+    order = np.argsort(t); t, h = t[order], h[order]
+    keep_t, keep_h = [t[0]], [h[0]]
+    for i in range(1, len(t)):
+        if t[i] - keep_t[-1] < _STRIKE_COALESCE_S:
+            if h[i] > keep_h[-1]:
+                keep_t[-1], keep_h[-1] = t[i], h[i]
+        else:
+            keep_t.append(t[i]); keep_h.append(h[i])
+    return np.asarray(keep_t), np.asarray(keep_h)
+
+
+def _grid_support(felt_beats: np.ndarray, strikes: np.ndarray,
+                  window_s: float = _GRID_SUPPORT_WINDOW_S) -> float:
+    """Fraction of felt beats with a strike within +/- window_s. 1.0 = grid sits
+    on the music, ~0 = the grid is fiction (rubato / sparse)."""
+    if len(felt_beats) == 0 or len(strikes) == 0:
+        return 0.0
+    strikes = np.asarray(strikes)
+    hits = sum(1 for b in felt_beats if np.min(np.abs(strikes - b)) <= window_s)
+    return hits / len(felt_beats)
+
+
+def _onset_anchor_spans(
+    felt_beats: np.ndarray, strikes: np.ndarray, duration: float, *,
+    thresh: float = _ONSET_ANCHOR_THRESH, min_span_s: float = _ONSET_ANCHOR_MIN_SPAN,
+    win_s: float = 8.0, step_s: float = 2.0,
+) -> list[tuple[float, float]]:
+    """Time spans where the beat grid is fiction and cuts should follow strikes.
+    Slides a window computing grid support, keeps runs below `thresh`, and returns
+    those lasting at least `min_span_s` (so the regime can't flap segment to
+    segment). Pure; exercised by tests/test_onset_anchor.py."""
+    felt_beats = np.asarray(felt_beats, dtype=float)
+    if duration <= 0 or len(felt_beats) == 0:
+        return []
+    centers, low = [], []
+    t = 0.0
+    while t < duration:
+        fb = felt_beats[(felt_beats >= t) & (felt_beats < t + win_s)]
+        centers.append(t + win_s / 2.0)
+        low.append(len(fb) > 0 and _grid_support(fb, strikes) < thresh)
+        t += step_s
+    # Merge consecutive low windows into spans (bridge the window overlap).
+    spans: list[tuple[float, float]] = []
+    i = 0
+    while i < len(low):
+        if low[i]:
+            j = i
+            while j + 1 < len(low) and low[j + 1]:
+                j += 1
+            t0 = max(0.0, centers[i] - win_s / 2.0)
+            t1 = min(duration, centers[j] + win_s / 2.0)
+            if t1 - t0 >= min_span_s:
+                spans.append((t0, t1))
+            i = j + 1
+        else:
+            i += 1
+    return spans
+
+
+def _onset_anchor_cuts(
+    span: tuple[float, float], strikes: np.ndarray,
+    tier_at: "callable", ambient_default: str = "slow",
+) -> list[tuple[float, str]]:
+    """Cut times inside an onset-anchor span: emit on prominent strikes at the
+    tier's photos-per-strike cadence (intense=every strike, normal=every 2nd,
+    slow/ambient=every 4th). Strike gaps LINGER (no phantom beats). Pure;
+    exercised by tests/test_onset_anchor.py."""
+    t0, t1 = span
+    sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    out: list[tuple[float, str]] = []
+    i = 0
+    while i < len(sel):
+        tier = tier_at(sel[i]) or ambient_default
+        out.append((sel[i], tier))
+        step = _PHOTOS_PER_STRIKE.get(tier, 2)
+        i += max(1, step)
+    return out
+
+
+def _splice_onset_anchor(
+    transitions: list[tuple[float, str]],
+    spans: list[tuple[float, float]],
+    strikes: np.ndarray,
+    tier_at: "callable",
+) -> list[tuple[float, str]]:
+    """Replace grid transitions inside onset-anchor spans with strike-anchored
+    cuts, leaving grid spans untouched. Pure; exercised by tests."""
+    if not spans:
+        return transitions
+    def _in_span(t: float) -> bool:
+        return any(t0 <= t < t1 for t0, t1 in spans)
+    kept = [(t, k) for (t, k) in transitions if not _in_span(t)]
+    for span in spans:
+        kept.extend(_onset_anchor_cuts(span, strikes, tier_at))
+    kept.sort(key=lambda tk: tk[0])
+    return kept
 
 
 def _occupancy_base_subdivision(
@@ -1445,6 +1617,7 @@ def build_timeline(
     tier_lead_seconds: float = 0.0,
     pace_model: str = "current",
     base_pace: str = "current",
+    onset_anchor: str = "auto",
 ) -> BeatTimeline:
     """Build a beat-aligned timeline matching photos to transition times.
 
@@ -1465,6 +1638,8 @@ def build_timeline(
     # spectral density (octave-free, from median-IBI), overriding the photo-count
     # driven subdivision. An explicit --beat-speed still wins over this.
     cut_felt_parity: int | None = None
+    onset_strikes: np.ndarray = np.array([])
+    onset_anchor_spans_final: list[tuple[float, float]] = []
     if base_pace == "occupancy" and beat_speed is None and len(beat_times) > 1:
         import librosa
 
@@ -1480,6 +1655,10 @@ def build_timeline(
             s = np.asarray(strengths, dtype=float)
             if len(s) > 3:
                 cut_felt_parity = 0 if s[0::2].mean() >= s[1::2].mean() else 1
+        # Peak-picked note attacks, for onset-anchoring sparse/rubato spans where
+        # the beat grid is fiction (see _prominent_strikes / _onset_anchor_spans).
+        if onset_anchor != "never":
+            onset_strikes, _ = _prominent_strikes(y_occ, sr_occ)
 
     # 3-tier pacing: pick the top-N most intense and top-N most quiet
     # *sustained* sections of the song. Rank-based (not threshold-based) so
@@ -1795,6 +1974,40 @@ def build_timeline(
         for t in reversed(pre_roll):
             transitions.insert(0, (float(t), "ambient"))
 
+    # Onset-anchor: in sparse/rubato spans the beat grid is fiction, so replace
+    # its cuts with cuts on the real note strikes (the events ARE the pulse there).
+    if onset_anchor != "never" and len(onset_strikes) > 0:
+        felt_for_support = (
+            beat_times[cut_felt_parity::2] if cut_felt_parity is not None else beat_times
+        )
+        if onset_anchor == "always":
+            anchor_spans = [(0.0, audio_duration)]
+        else:
+            anchor_spans = _onset_anchor_spans(
+                felt_for_support, onset_strikes, audio_duration
+            )
+
+        def _tier_at_time(t: float) -> str:
+            for a, b in intense_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "intense"
+            for a, b in slow_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "slow"
+            for a, b in ambient_regions:
+                if a - 1e-6 <= t <= b + 1e-6:
+                    return "ambient"
+            return "normal"
+
+        transitions = _splice_onset_anchor(
+            transitions, anchor_spans, onset_strikes, _tier_at_time
+        )
+        onset_anchor_spans_final = anchor_spans
+        # The splice may have removed the t=0 start (it sits inside the intro
+        # span); restore it so the timeline still opens at audio time 0.
+        if transitions and transitions[0][0] > 1e-3:
+            transitions.insert(0, (0.0, transitions[0][1]))
+
     transitions = _drop_opening_flash(transitions)
 
     # Compute durations: each transition's duration is the gap to the next,
@@ -1872,4 +2085,6 @@ def build_timeline(
         intense_multiplier=eff_intense_mult,
         slow_multiplier=eff_slow_mult,
         beat_times=[float(t) for t in beat_times],
+        onset_anchor_spans=onset_anchor_spans_final,
+        onset_strikes=[float(t) for t in onset_strikes],
     )
