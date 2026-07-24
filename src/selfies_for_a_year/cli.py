@@ -903,10 +903,8 @@ def compile(
     min_normal_bridge_beats: Annotated[float, typer.Option(help="[--vary-pace] Tiny 'normal' bridges between two overlay regions (slow→intense etc.) shorter than this many beats get absorbed into the next region so the transition is direct.")] = 8.0,
     snap_to_grid: Annotated[bool, typer.Option(help="[--vary-pace] Snap --intense/--slow-multiplier to the nearest power-of-2 musical fraction (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16) so cuts stay on the 4/4 grid. Disable to allow triplets/polyrhythms.")] = True,
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
-    pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections), 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled), or 'segment' (Foote-segmented cyan-height, per-section scored; best structural alignment). 'viterbi'/'segment' imply --vary-pace.")] = "current",
-    base_pace: Annotated[str, typer.Option(help="[--beat-sync] Base (normal-tier) photo density: 'current' (packs to fit the photo set) or 'occupancy' (matches the song's spectral density — sparse songs linger, dense songs drive; subsets photos to hold the pace). Octave-free; overridden by --beat-speed.")] = "current",
-    onset_anchor: Annotated[str, typer.Option(help="[--base-pace occupancy] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
-    intense_per_kick: Annotated[str, typer.Option(help="[--base-pace occupancy] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
+    onset_anchor: Annotated[str, typer.Option(help="[--beat-sync] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
+    intense_per_kick: Annotated[str, typer.Option(help="[--beat-sync] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
     preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
@@ -980,6 +978,16 @@ def compile(
         typer.echo("Error: --fit-to-music requires --music.", err=True)
         raise typer.Exit(1)
 
+    # Default to the settled beat-synced pacing pipeline. Providing --music alone
+    # gives a beat-synced, pace-varied render (segment tiers + occupancy base
+    # pace); opt out with --no-beat-sync (plain slideshow) or --no-vary-pace.
+    _src = ctx.get_parameter_source
+    _CMD = click.core.ParameterSource.COMMANDLINE
+    if music is not None and _src("beat_sync") != _CMD:
+        beat_sync = True
+    if beat_sync and _src("vary_pace") != _CMD:
+        vary_pace = True
+
     if beat_sync and music is None:
         typer.echo("Error: --beat-sync requires --music.", err=True)
         raise typer.Exit(1)
@@ -996,20 +1004,12 @@ def compile(
         )
         raise typer.Exit(1)
 
-    if pace_model not in ("current", "viterbi", "segment"):
-        typer.echo(f"Error: --pace-model must be 'current', 'viterbi', or 'segment', got '{pace_model}'.", err=True)
-        raise typer.Exit(1)
-    if base_pace not in ("current", "occupancy"):
-        typer.echo(f"Error: --base-pace must be 'current' or 'occupancy', got '{base_pace}'.", err=True)
-        raise typer.Exit(1)
     if onset_anchor not in ("auto", "never", "always"):
         typer.echo(f"Error: --onset-anchor must be 'auto', 'never', or 'always', got '{onset_anchor}'.", err=True)
         raise typer.Exit(1)
     if intense_per_kick not in ("auto", "on", "off"):
         typer.echo(f"Error: --intense-per-kick must be 'auto', 'on', or 'off', got '{intense_per_kick}'.", err=True)
         raise typer.Exit(1)
-    if pace_model in ("viterbi", "segment"):
-        vary_pace = True  # model-driven tiers only mean something with multipliers
 
 
     # --duration is meaningless under --fit-to-music (the per-photo time is
@@ -1237,8 +1237,8 @@ def compile(
             min_normal_bridge_beats=min_normal_bridge_beats,
             snap_to_grid=snap_to_grid,
             tier_lead_seconds=tier_lead_seconds,
-            pace_model=pace_model,
-            base_pace=base_pace,
+            pace_model="segment",
+            base_pace="occupancy",
             onset_anchor=onset_anchor,
             intense_per_kick=intense_per_kick,
         )
