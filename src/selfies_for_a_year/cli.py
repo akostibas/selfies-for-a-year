@@ -907,14 +907,7 @@ def compile(
     intense_per_kick: Annotated[str, typer.Option(help="[--beat-sync] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
     preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
-    debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
-    debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
-    # COMPAT: default-on for review renders while we tune pacing. Production
-    # renders must pass --no-debug-progression-overlay --no-debug-metronome (plus
-    # --no-debug-tier-overlay --no-debug-filename-overlay) for a clean output.
-    # Revisit / restore False defaults once a production render path exists. Remove after 2026-08-24.
-    debug_progression_overlay: Annotated[bool, typer.Option(help="[--beat-sync] Draw a horizontal track-progression bar across the top: colored by pacing state with a moving playhead. Forces constant-fps rendering. Default-on for review (COMPAT).")] = True,
-    debug_metronome: Annotated[bool, typer.Option(help="[--beat-sync] Draw a metronome dot (bottom-left) that flashes on each detected beat, so you can see whether cuts land on the beat. Forces constant-fps rendering. Default-on for review (COMPAT).")] = True,
+    debug: Annotated[bool, typer.Option(help="Overlay ALL review HUDs: pacing tier + song/BPM, source filename, the track-progression bar with playhead, and the metronome dot (flashes on each cut target — strikes in onset-anchor spans). On for iteration/review; leave off for a clean production render. Forces constant-fps rendering.")] = False,
     emit_progression: Annotated[bool, typer.Option(help="[--beat-sync] Print the track progression model (states + pacing sanity metrics) to stdout, then continue rendering.")] = False,
     emit_progression_json: Annotated[Path | None, typer.Option(help="[--beat-sync] Write the track progression model as JSON to this path.")] = None,
     analyze_only: Annotated[bool, typer.Option(help="[--beat-sync] Run beat/pacing analysis and emit the progression model, then exit WITHOUT rendering video. Fast iteration loop for pacing params.")] = False,
@@ -987,6 +980,13 @@ def compile(
         beat_sync = True
     if beat_sync and _src("vary_pace") != _CMD:
         vary_pace = True
+
+    # One --debug flag drives every review HUD; the render helpers still take the
+    # individual toggles internally.
+    debug_tier_overlay = debug
+    debug_filename_overlay = debug
+    debug_progression_overlay = debug
+    debug_metronome = debug
 
     if beat_sync and music is None:
         typer.echo("Error: --beat-sync requires --music.", err=True)
