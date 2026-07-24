@@ -1117,15 +1117,35 @@ def _pace_foote_novelty(ssm: np.ndarray, kernel_size: int) -> np.ndarray:
 def _pace_mode_anchored_centers(vals: np.ndarray) -> np.ndarray:
     """Tier centers anchored at the BASELINE (mode = the groove the song sits at
     most often), with asymmetric up/down spread. The median is dragged up by
-    peaks and pushes the baseline into 'slow'; the mode stays put."""
+    peaks and pushes the baseline into 'slow'; the mode stays put. Not clipped to
+    [0,1]: `combined` ranges past 1.0, and clipping crushed normal/intense
+    together on tracks whose typical section already sits high, erasing intense."""
     lo, hi = float(np.percentile(vals, 5)), float(np.percentile(vals, 95))
     hist, edges = np.histogram(vals, bins=20, range=(vals.min(), vals.max() + 1e-9))
     mode = 0.5 * (edges[hist.argmax()] + edges[hist.argmax() + 1])
     up = max(hi - mode, 0.05)
     dn = max(mode - lo, 0.05)
-    return np.clip(
-        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0, 1.0
+    return np.maximum(
+        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0
     )
+
+
+def _pace_rolling_p80(x: np.ndarray, win: int = 16) -> np.ndarray:
+    """p80 of x in a centered ~win-beat window at every beat — used to calibrate
+    tier centers on the SAME statistic sections are scored with (p80). Fitting
+    centers on raw per-beat values is a statistic mismatch: p80 is upward-biased,
+    so on burst-texture tracks the per-beat mode sits among gap beats and every
+    section's p80 rides above it, making slow/ambient unreachable. See
+    experiments/pacing_recipes.py _rolling_p80."""
+    n = len(x)
+    if n == 0:
+        return x
+    r = win // 2
+    out = np.zeros(n)
+    for i in range(n):
+        a, b = max(0, i - r), min(n, i + r + 1)
+        out[i] = np.percentile(x[a:b], 80)
+    return out
 
 
 def _pace_tiers_segment(
@@ -1203,7 +1223,9 @@ def _pace_tiers_segment(
         bounds = sorted(set([0] + [int(p) for p in peaks]))
 
     seg_edges = list(zip(bounds, bounds[1:] + [n]))
-    centers = _pace_mode_anchored_centers(combined)
+    # Calibrate centers on the section-scale statistic (rolling-p80), matching the
+    # p80 segment scores, so slow/ambient are reachable on burst-texture tracks.
+    centers = _pace_mode_anchored_centers(_pace_rolling_p80(combined, 16))
     tiers = ["normal"] * n
     for s0, s1 in seg_edges:
         if s1 <= s0:

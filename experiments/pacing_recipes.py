@@ -506,14 +506,17 @@ def recipe_b(
 # --------------------------------------------------------------------------- #
 def _mode_anchored_centers(vals: np.ndarray) -> tuple[np.ndarray, float]:
     """Tier centers anchored at the BASELINE (mode) of the value distribution,
-    with asymmetric up/down spread. Shared by recipe A and C."""
+    with asymmetric up/down spread. Not clipped to [0,1]: `combined` (height +
+    modulation-depth boost) ranges past 1.0, and clipping crushed the normal/
+    intense centers together on tracks whose typical section already sits high
+    (e.g. TBAH's rolling-p80 mode ~1.0), erasing the intense tier."""
     lo, hi = float(np.percentile(vals, 5)), float(np.percentile(vals, 95))
     hist, edges = np.histogram(vals, bins=20, range=(vals.min(), vals.max() + 1e-9))
     mode = 0.5 * (edges[hist.argmax()] + edges[hist.argmax() + 1])
     up = max(hi - mode, 0.05)
     dn = max(mode - lo, 0.05)
-    centers = np.clip(
-        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0, 1.0
+    centers = np.maximum(
+        np.array([mode - 0.9 * dn, mode - 0.45 * dn, mode, mode + 0.6 * up]), 0.0
     )
     return centers, max(0.35 * (hi - lo), 0.05)
 
@@ -545,6 +548,27 @@ def _recipe_c_features(f: Features):
         w = height_raw[a:b]
         moddepth[i] = np.percentile(w, 90) - np.percentile(w, 10) if len(w) else 0.0
     return height_raw, lrms_beat, mfcc_beat, moddepth
+
+
+def _rolling_p80(x: np.ndarray, win: int = 16) -> np.ndarray:
+    """p80 of x in a centered ~win-beat window at every beat. Used to calibrate
+    tier centers on the SAME statistic family sections are scored with (p80).
+    Fitting centers on raw per-beat values instead is a statistic mismatch: p80
+    is upward-biased vs per-beat, so on burst-texture tracks (many gap beats) the
+    per-beat mode sits among the gaps and EVERY section's p80 rides above it —
+    making slow/ambient unreachable for any section. Calibrating on rolling-p80
+    makes the mode mean 'typical section-level score', so lulls can fall below
+    it. Order statistic of actual values => magnitudes survive (unlike a rank
+    transform, which manufactures range on flat tracks and flattens dynamic ones)."""
+    n = len(x)
+    if n == 0:
+        return x
+    r = win // 2
+    out = np.zeros(n)
+    for i in range(n):
+        a, b = max(0, i - r), min(n, i + r + 1)
+        out[i] = np.percentile(x[a:b], 80)
+    return out
 
 
 def _beat_smooth(x: np.ndarray, w: int = 8) -> np.ndarray:
@@ -611,9 +635,11 @@ def recipe_c(f: Features) -> list[tuple[float, float, str]]:
     bounds = _recipe_c_boundaries(height_raw, lrms_beat, mfcc_beat, moddepth)
     seg_edges = list(zip(bounds, bounds[1:] + [len(f.beat_times)]))
 
-    # Centers over PER-BEAT combined signal (n~600, time-weighted, stable) — NOT
-    # over the handful of segment scores. Score each segment by its MEDIAN.
-    centers, _ = _mode_anchored_centers(combined)
+    # Centers calibrated on the SECTION-scale statistic (rolling-p80 of combined
+    # over 16 beats, n~600, time-weighted) so they share a scale with the p80
+    # segment scores. Fitting on raw per-beat combined instead leaves slow/ambient
+    # unreachable on burst-texture tracks (p80 rides above the per-beat mode).
+    centers, _ = _mode_anchored_centers(_rolling_p80(combined, 16))
     tiers_by_beat = ["normal"] * len(f.beat_times)
     for s0, s1 in seg_edges:
         if s1 <= s0:
