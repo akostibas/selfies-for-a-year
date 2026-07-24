@@ -900,6 +900,7 @@ def compile(
     min_normal_bridge_beats: Annotated[float, typer.Option(help="[--vary-pace] Tiny 'normal' bridges between two overlay regions (slow→intense etc.) shorter than this many beats get absorbed into the next region so the transition is direct.")] = 8.0,
     snap_to_grid: Annotated[bool, typer.Option(help="[--vary-pace] Snap --intense/--slow-multiplier to the nearest power-of-2 musical fraction (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16) so cuts stay on the 4/4 grid. Disable to allow triplets/polyrhythms.")] = True,
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
+    pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections) or 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled; fixes false-ambient over-labeling). 'viterbi' implies --vary-pace.")] = "current",
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
@@ -983,6 +984,12 @@ def compile(
             err=True,
         )
         raise typer.Exit(1)
+
+    if pace_model not in ("current", "viterbi"):
+        typer.echo(f"Error: --pace-model must be 'current' or 'viterbi', got '{pace_model}'.", err=True)
+        raise typer.Exit(1)
+    if pace_model == "viterbi":
+        vary_pace = True  # the Viterbi tiers only mean something with multipliers
 
 
     # --duration is meaningless under --fit-to-music (the per-photo time is
@@ -1200,6 +1207,7 @@ def compile(
             min_normal_bridge_beats=min_normal_bridge_beats,
             snap_to_grid=snap_to_grid,
             tier_lead_seconds=tier_lead_seconds,
+            pace_model=pace_model,
         )
         typer.echo(timeline.summary())
 

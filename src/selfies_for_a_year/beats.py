@@ -922,6 +922,183 @@ def _summarize_per_month(
     return [(f"{k[0]}-{k[1]:02d}", v[0], v[1]) for k, v in by_month.items()]
 
 
+# --- Viterbi pacing model (experimental alternative to _classify_regions +
+#     _pick_top_sections) ---------------------------------------------------
+#
+# Motivation (issue #43): the shipping tier map over-labels "ambient" because
+# it gates on max-normalized ONSET STRENGTH (an event/attack detector), so a
+# loud-but-steady passage reads as "no beat." This model instead builds a
+# per-beat ENERGY signal from RMS loudness + onset rate, then labels the whole
+# timeline with Viterbi (one switch-penalty knob) so tiers come out contiguous
+# — no per-beat chatter, no per-genre parameters. Tiers stay per-song relative
+# (a quiet song still gets its own loudest moment as "intense"), per intent #4.
+_PACE_TIERS = ("ambient", "slow", "normal", "intense")
+
+
+def _pace_robust_norm(x: np.ndarray) -> np.ndarray:
+    """Min-max to [0,1] using 5th/95th pct as the range (silence-robust)."""
+    if len(x) == 0:
+        return x
+    lo, hi = np.percentile(x, 5), np.percentile(x, 95)
+    if hi - lo < 1e-9:
+        return np.zeros_like(x)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _pace_moving_median(x: np.ndarray, win: int) -> np.ndarray:
+    """Odd-window edge-padded moving median — smooth the CONTINUOUS energy so
+    tiers come out contiguous (vs. smoothing labels, which cascades)."""
+    if win <= 1 or len(x) == 0:
+        return x
+    if win % 2 == 0:
+        win += 1
+    r = win // 2
+    pad = np.pad(x, r, mode="edge")
+    return np.array([np.median(pad[i : i + win]) for i in range(len(x))])
+
+
+def _pace_viterbi(
+    energy: np.ndarray, centers: np.ndarray, sigma: float, switch_penalty: float
+) -> list[str]:
+    """Label each beat by Viterbi: emission cost (energy-center)^2/(2 sigma^2)
+    vs. a flat per-switch penalty. High penalty -> long contiguous runs."""
+    n = len(energy)
+    k = len(centers)
+    if n == 0:
+        return []
+    emit = (energy[:, None] - centers[None, :]) ** 2 / (2.0 * sigma**2)
+    cost = np.full((n, k), np.inf)
+    back = np.zeros((n, k), dtype=int)
+    cost[0] = emit[0]
+    switch = np.full(k, switch_penalty)
+    for t in range(1, n):
+        for s in range(k):
+            trans = cost[t - 1] + switch
+            trans[s] -= switch_penalty  # staying in s is free
+            j = int(np.argmin(trans))
+            cost[t, s] = trans[j] + emit[t, s]
+            back[t, s] = j
+    path = [int(np.argmin(cost[-1]))]
+    for t in range(n - 1, 0, -1):
+        path.append(back[t, path[-1]])
+    path.reverse()
+    return [_PACE_TIERS[s] for s in path]
+
+
+def _pace_merge_short_runs(tiers: list[str], min_beats: int) -> list[str]:
+    """Merge any tier run shorter than min_beats into its longer neighbor.
+    Applied to clean Viterbi output, so it's a stable sweep. Encodes 'a tier
+    must last >= min_beats to register as a section' (a 2s flip is a stutter)."""
+    out = list(tiers)
+    while True:
+        runs: list[list] = []
+        i = 0
+        while i < len(out):
+            j = i
+            while j + 1 < len(out) and out[j + 1] == out[i]:
+                j += 1
+            runs.append([i, j, out[i]])
+            i = j + 1
+        if len(runs) <= 1:
+            break
+        shorts = [r for r in runs if (r[1] - r[0] + 1) < min_beats]
+        if not shorts:
+            break
+        r = min(shorts, key=lambda r: r[1] - r[0])
+        k = runs.index(r)
+        left = runs[k - 1] if k > 0 else None
+        right = runs[k + 1] if k + 1 < len(runs) else None
+        pick = (left if (not right or (left and (left[1] - left[0]) >= (right[1] - right[0])))
+                else right)
+        for idx in range(r[0], r[1] + 1):
+            out[idx] = pick[2]
+    return out
+
+
+def _pace_tiers_viterbi(
+    audio_path: Path,
+    beat_times: np.ndarray,
+    bpm: float,
+    *,
+    w_loud: float = 0.7,
+    smooth_beats: int = 6,
+    switch_penalty: float = 4.0,
+    min_run_seconds: float = 4.0,
+) -> list[str]:
+    """Per-beat pacing tiers via the energy+Viterbi model. Loads the audio to
+    compute RMS loudness + onset rate at each beat."""
+    import librosa
+
+    if len(beat_times) == 0:
+        return []
+    y, sr = librosa.load(str(audio_path), mono=True)
+    hop = 512
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop)
+    beat_frames = np.clip(np.asarray(beat_frames, dtype=int), 0, None)
+
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-6))
+    loud = rms_db[np.clip(beat_frames, 0, len(rms_db) - 1)]
+
+    onset_times = np.asarray(
+        librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, hop_length=hop, units="time")
+    )
+    if len(onset_times):
+        lo = np.searchsorted(onset_times, beat_times - 0.5)
+        hi = np.searchsorted(onset_times, beat_times + 0.5)
+        rate = (hi - lo).astype(float)
+    else:
+        rate = np.zeros(len(beat_times))
+
+    energy = w_loud * _pace_robust_norm(loud) + (1.0 - w_loud) * _pace_robust_norm(rate)
+    energy = _pace_moving_median(energy, smooth_beats)
+    # Fixed centers in the per-song normalized [0,1] space keep tiers from
+    # collapsing when a long tail skews the distribution, while robust_norm
+    # keeps them per-song relative.
+    centers = np.array([0.12, 0.37, 0.62, 0.87])
+    tiers = _pace_viterbi(energy, centers, 0.18, switch_penalty)
+    min_beats = max(1, round(min_run_seconds * bpm / 60.0)) if bpm > 0 else 1
+    return _pace_merge_short_runs(tiers, min_beats)
+
+
+def _pace_tiers_to_regions(
+    tiers: list[str], beat_times: np.ndarray, audio_duration: float
+) -> tuple[
+    list[tuple[float, float]], list[tuple[float, float]],
+    list[tuple[float, float]], list[tuple[float, float]],
+    np.ndarray, np.ndarray,
+]:
+    """Convert per-beat tiers into the (intense, slow, ambient, beat/normal)
+    regions + per-beat intense/slow masks the renderer consumes. Regions tile
+    [0, audio_duration] with no gaps (each run spans to the next run's start)."""
+    n = len(beat_times)
+    intense: list[tuple[float, float]] = []
+    slow: list[tuple[float, float]] = []
+    ambient: list[tuple[float, float]] = []
+    beat: list[tuple[float, float]] = []
+    intense_mask = np.zeros(n, dtype=bool)
+    slow_mask = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and tiers[j + 1] == tiers[i]:
+            j += 1
+        a = 0.0 if i == 0 else float(beat_times[i])
+        b = float(beat_times[j + 1]) if j + 1 < n else audio_duration
+        t = tiers[i]
+        if t == "intense":
+            intense.append((a, b)); intense_mask[i : j + 1] = True
+        elif t == "slow":
+            slow.append((a, b)); slow_mask[i : j + 1] = True
+        elif t == "ambient":
+            ambient.append((a, b))
+        else:
+            beat.append((a, b))
+        i = j + 1
+    return intense, slow, ambient, beat, intense_mask, slow_mask
+
+
 def build_timeline(
     audio_path: Path,
     photo_dates: list[datetime],
@@ -941,10 +1118,13 @@ def build_timeline(
     min_normal_bridge_beats: float = 8.0,
     snap_to_grid: bool = True,
     tier_lead_seconds: float = 0.0,
+    pace_model: str = "current",
 ) -> BeatTimeline:
     """Build a beat-aligned timeline matching photos to transition times.
 
     photo_dates: dates for the *kept* photos (post-alignment), in order.
+    pace_model: "current" (onset-strength gate + quantile top-N sections) or
+      "viterbi" (RMS-loudness + onset-rate energy, Viterbi-labeled tiers).
     """
     n_photos = len(photo_dates)
     beat_times, strengths, loudness, loudness_anticausal, bpm, audio_duration = _detect_beats(
@@ -1040,6 +1220,20 @@ def build_timeline(
             slow_mask |= (beat_times >= a - 1e-6) & (beat_times <= b + 1e-6)
         # An extended slow region might now overlap an intense one — intense wins.
         slow_mask &= ~intense_mask
+
+    # Viterbi pacing model: replace the region set computed above with tiers
+    # from the RMS-loudness + onset-rate energy signal. Overwrites rather than
+    # branches so all downstream transition/segment logic is shared.
+    if pace_model == "viterbi" and vary_pace and len(beat_times) > 0:
+        tiers = _pace_tiers_viterbi(audio_path, beat_times, bpm)
+        (intense_regions, slow_regions, ambient_regions, beat_regions,
+         intense_mask, slow_mask) = _pace_tiers_to_regions(tiers, beat_times, audio_duration)
+        eff_intense_mult = intense_multiplier
+        eff_slow_mult = slow_multiplier
+        if snap_to_grid:
+            grid = (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16)
+            eff_intense_mult = min(grid, key=lambda g: abs(g - eff_intense_mult) / eff_intense_mult)
+            eff_slow_mult = min(grid, key=lambda g: abs(g - eff_slow_mult) / eff_slow_mult)
 
     def _ambient_subregions(region: tuple[float, float]) -> list[tuple[tuple[float, float], float]]:
         """Slice an ambient region into sub-spans tagged with their tier
