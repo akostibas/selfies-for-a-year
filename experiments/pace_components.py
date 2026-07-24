@@ -29,6 +29,7 @@ sys.path.insert(0, "experiments")
 from pacing_recipes import (
     HOP, TIERS, load_features, _robust_norm,
     _recipe_c_features, _recipe_c_energy, _recipe_c_boundaries, _mode_anchored_centers,
+    _rolling_p80,
 )
 
 TIER_RGB = {"ambient": (150, 150, 150), "slow": (90, 200, 110),
@@ -51,7 +52,7 @@ def main(argv):
     w = float(np.clip((iqr_db - 3.0) / 6.0, 0.0, 1.0))
     energy = _recipe_c_energy(f, hr)
     combined = energy + 0.6 * move_n
-    centers, _ = _mode_anchored_centers(combined)
+    centers, _ = _mode_anchored_centers(_rolling_p80(combined, 16))
     bounds = _recipe_c_boundaries(hr, lr, mf, md)
     seg_edges = list(zip(bounds, bounds[1:] + [len(bt)]))
     seg_t = [float(bt[b]) for b in bounds if b < len(bt)]

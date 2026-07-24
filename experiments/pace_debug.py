@@ -23,7 +23,7 @@ from matplotlib.patches import Rectangle
 sys.path.insert(0, "experiments")
 from pacing_recipes import (
     HOP, TIERS, load_features, _robust_norm,
-    _recipe_c_features, _recipe_c_boundaries, _mode_anchored_centers,
+    _recipe_c_features, _recipe_c_boundaries, _mode_anchored_centers, _rolling_p80,
 )
 
 TIER_RGB = {"ambient": (150, 150, 150), "slow": (90, 200, 110),
@@ -43,7 +43,7 @@ def decompose(f):
     c_depth = 0.6 * depth_n
     combined = c_height + c_loud + c_depth
     bounds = _recipe_c_boundaries(hr, lr, mf, md)
-    centers, _ = _mode_anchored_centers(combined)
+    centers, _ = _mode_anchored_centers(_rolling_p80(combined, 16))
     return dict(w=w, iqr_db=iqr_db, c_height=c_height, c_loud=c_loud,
                 c_depth=c_depth, combined=combined, bounds=bounds, centers=centers)
 
