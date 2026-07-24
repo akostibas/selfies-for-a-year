@@ -821,7 +821,17 @@ def _onset_anchor_spans(
             i = j + 1
         else:
             i += 1
-    return spans
+    # Runs are padded by ±win_s/2, so two runs whose centers sit within a window
+    # of each other produce spans that overlap or touch. Coalesce them: callers
+    # splice strikes per span, and a strike inside two spans would be cut twice
+    # (duplicate transition times -> a 50ms flicker frame).
+    merged: list[tuple[float, float]] = []
+    for t0, t1 in spans:
+        if merged and t0 <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], t1))
+        else:
+            merged.append((t0, t1))
+    return merged
 
 
 def _onset_anchor_cuts(

@@ -5,14 +5,13 @@ pure scheduling pieces (no audio): grid-support scoring, span detection, the
 photos-per-strike cadence, and splicing strike cuts over grid cuts.
 """
 import numpy as np
-import pytest
 
 from selfies_for_a_year.beats import (
-    _grid_support,
-    _onset_anchor_spans,
-    _onset_anchor_cuts,
-    _splice_onset_anchor,
     _PHOTOS_PER_STRIKE,
+    _grid_support,
+    _onset_anchor_cuts,
+    _onset_anchor_spans,
+    _splice_onset_anchor,
 )
 
 
@@ -50,6 +49,38 @@ def test_onset_anchor_spans_respects_min_span():
     strikes = strikes[(strikes < 10) | (strikes > 12)]
     spans = _onset_anchor_spans(beats, strikes, 40.0)
     assert all(b - a >= 8.0 for a, b in spans)
+
+
+def test_onset_anchor_spans_never_overlap():
+    """Two sparse pockets close together must merge, not produce overlapping spans.
+
+    Runs are padded by ±win_s/2, so nearby runs used to emit spans like
+    (194,202) and (200,226). _splice_onset_anchor cuts strikes per span, so
+    every strike in the overlap was emitted twice — coincident transition times
+    that the duration floor turned into a 50ms flicker frame (seen on
+    "To Build a Home" at 3:20).
+    """
+    beats = np.arange(0, 120.0, 0.42)
+    # Strikes thinned to sit near the support threshold, so window support
+    # wobbles across it the way real sparse passages do — that wobble is what
+    # separates two low runs by one or two windows and makes their padded spans
+    # overlap. Seed 0 produced (26,46) vs (44,52) before the fix.
+    rng = np.random.default_rng(0)
+    strikes = beats[rng.random(len(beats)) < 0.32] + 0.01
+    spans = _onset_anchor_spans(beats, strikes, 120.0)
+    assert len(spans) > 1, "construction should yield several spans"
+    for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+        assert a1 <= b0, f"overlapping spans {(a0, a1)} and {(b0, b1)}"
+
+
+def test_splice_emits_each_strike_once_across_spans():
+    """Even given adjacent spans, no strike may produce two cuts at the same time."""
+    grid = [(t, "normal") for t in np.arange(0, 30, 1.0)]
+    strikes = np.array([2.5, 7.5, 12.5, 17.5])
+    spans = [(0.0, 10.0), (10.0, 20.0)]
+    out = _splice_onset_anchor(grid, spans, strikes, lambda t: "intense")
+    times = [t for t, _ in out]
+    assert len(times) == len(set(times)), f"duplicate cut times: {times}"
 
 
 def test_photos_per_strike_cadence():
