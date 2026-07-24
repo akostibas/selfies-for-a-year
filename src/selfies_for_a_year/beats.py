@@ -1208,7 +1208,10 @@ def _pace_tiers_segment(
     for s0, s1 in seg_edges:
         if s1 <= s0:
             continue
-        score = float(np.median(combined[s0:s1]))
+        # Score by p80 ("how bright does this section GET"), not median: rewards a
+        # segment that spikes even if calm on average, and doubles as a duty-cycle
+        # floor for burst trains. See experiments/pacing_recipes.py recipe_c.
+        score = float(np.percentile(combined[s0:s1], 80))
         tier = _PACE_TIERS[int(np.argmin((score - centers) ** 2))]
         for i in range(s0, s1):
             tiers[i] = tier

@@ -582,11 +582,13 @@ def _recipe_c_boundaries(height_raw, lrms_beat, mfcc_beat, moddepth,
 
 
 def _recipe_c_energy(f: Features, height_raw: np.ndarray) -> np.ndarray:
-    """Per-beat energy = cyan height, with a VARIANCE-GATED loudness blend.
+    """Per-beat energy = cyan height with a VARIANCE-GATED loudness blend.
     Brightness alone under-ranks sustained full-band climaxes on dynamic tracks
-    (less bright but loud); dB is useless only on brick-limited masters. Gate on
-    the song's own loudness spread: flat masters -> w=0 (pure height, nothing
-    regresses); dynamic -> w->1 (loud climaxes score high). No cross-song absolutes."""
+    (less bright but loud); dB is useless only on brick-limited masters. So blend
+    in normalized loudness with a weight w set by the song's own loudness spread
+    (IQR of RMS-dB): flat/compressed masters -> w≈0 (pure height, nothing
+    regresses); dynamic masters -> w->1 (loud climaxes lift the score). The
+    /(1+w) keeps the blend in [0,1]. No cross-song absolutes."""
     height_n = _robust_norm(height_raw)
     loud_n = _robust_norm(f.loudness_db)
     iqr_db = float(np.percentile(f.loudness_db, 75) - np.percentile(f.loudness_db, 25))
@@ -616,7 +618,11 @@ def recipe_c(f: Features) -> list[tuple[float, float, str]]:
     for s0, s1 in seg_edges:
         if s1 <= s0:
             continue
-        score = float(np.median(combined[s0:s1]))
+        # Score by p80, NOT median (waveform-eng): "how bright does this section
+        # GET" rewards a segment that spikes even if calm on average, and the
+        # percentile doubles as a duty-cycle floor (a burst train firing ~30% of
+        # its beats reads intense; a lone spike in a quiet span stays quiet).
+        score = float(np.percentile(combined[s0:s1], 80))
         tier = TIERS[int(np.argmin((score - centers) ** 2))]
         for i in range(s0, s1):
             tiers_by_beat[i] = tier
