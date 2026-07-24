@@ -431,6 +431,7 @@ def _beat_frames(
     bpm: float | None = None,
     progression_states: list[tuple[float, float, str]] | None = None,
     metronome_beats: list[float] | None = None,
+    max_seconds: float | None = None,
 ) -> tuple[Iterator[Image.Image], int]:
     """Render beat-sync segments as constant-fps frames.
 
@@ -458,6 +459,8 @@ def _beat_frames(
 
     total_duration = sum(seg.duration for seg in segments)
     n_frames = max(1, round(total_duration * fps))
+    if max_seconds is not None:
+        n_frames = min(n_frames, max(1, round(max_seconds * fps)))
 
     # The metronome dot rides at a fixed screen position (end of the debug
     # block's BPM row), so compute its anchor once rather than per frame.
@@ -902,6 +905,7 @@ def compile(
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
     pace_model: Annotated[str, typer.Option(help="[--vary-pace] Pacing tier algorithm: 'current' (onset-strength gate + quantile sections), 'viterbi' (RMS-loudness + onset-rate energy, Viterbi-labeled), or 'segment' (Foote-segmented cyan-height, per-section scored; best structural alignment). 'viterbi'/'segment' imply --vary-pace.")] = "current",
     base_pace: Annotated[str, typer.Option(help="[--beat-sync] Base (normal-tier) photo density: 'current' (packs to fit the photo set) or 'occupancy' (matches the song's spectral density — sparse songs linger, dense songs drive; subsets photos to hold the pace). Octave-free; overridden by --beat-speed.")] = "current",
+    preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug_tier_overlay: Annotated[bool, typer.Option(help="[--vary-pace] Overlay the current pacing tier (slow/normal/intense/ambient) on each frame for visual debugging.")] = False,
     debug_filename_overlay: Annotated[bool, typer.Option(help="Overlay the source photo filename (truncated) on each frame for tracing back to originals.")] = False,
@@ -1038,6 +1042,16 @@ def compile(
         )
     else:
         typer.echo(f"Found {len(paths)} images. ({duration}ms/photo at {FPS}fps)")
+
+    # Preview mode: only the first N seconds are encoded, so only the photos that
+    # can appear in that window need aligning. Cap at the ceiling pace so we never
+    # starve the clip; the occupancy pace is slower, leaving a safe margin.
+    if preview_seconds is not None:
+        k = max(2, int(preview_seconds * max_photos_per_second) + 2)
+        if k < len(paths):
+            paths = paths[:k]; dates = dates[:k]; labels = labels[:k]
+            face_hints = face_hints[:k]; apple_quality = apple_quality[:k]
+            typer.echo(f"Preview: first {preview_seconds:g}s — aligning {len(paths)} photos only.")
 
     # --- Pass 1: Align/prepare all frames ---
     if align:
@@ -1242,8 +1256,10 @@ def compile(
         progression_states = [(s.start, s.end, s.tier) for s in progression.states]
 
         # Validate bounds. Bounds are only enforced in auto mode; if the user
-        # set --beat-speed they've explicitly opted out of auto-pick.
-        if beat_speed is None and not force:
+        # set --beat-speed they've explicitly opted out of auto-pick. Preview
+        # mode deliberately uses only the first few photos, so the "too few to
+        # fill the song" guard doesn't apply — skip it like --force.
+        if beat_speed is None and not force and preview_seconds is None:
             problems: list[str] = []
             remedies: list[str] = []
             if timeline.bounds_violation == "ceiling":
@@ -1312,6 +1328,7 @@ def compile(
                 bpm=timeline.bpm,
                 progression_states=progression_states if debug_progression_overlay else None,
                 metronome_beats=metronome_beats,
+                max_seconds=preview_seconds,
             )
             mode = "continuous crossfade" if beat_crossfade else "constant-fps hard cut"
             typer.echo(
@@ -1380,7 +1397,7 @@ def compile(
                     f.write(f"{dt.strftime('%Y-%m-%d %H:%M:%S')}\t{path}\t{status}\t{reason}\n")
 
         typer.echo(
-            f"Done! {output} ({rendered_count} frames, {timeline.total_duration:.1f}s)"
+            f"Done! {output} ({rendered_count} frames, {rendered_count / FPS:.1f}s)"
         )
         return
 
