@@ -1402,7 +1402,9 @@ def _weighted_decimate_by_month(
 ) -> tuple[list[int], list[tuple[str, int, int]]]:
     """Pick `target` indices, allocating slots per month proportional to count.
 
-    Floors at 1 per non-empty month. Returns (selected_sorted, per_month_log).
+    Floors at 1 per non-empty month, unless there are more months than slots —
+    then whole months are dropped, evenly across the span. Returns
+    (selected_sorted, per_month_log).
     """
     if target >= len(indices):
         # Nothing to drop
@@ -1414,6 +1416,37 @@ def _weighted_decimate_by_month(
         d = dates[idx]
         key = (d.year, d.month)
         by_month.setdefault(key, []).append(idx)
+
+    if 0 < target < len(by_month):
+        # More non-empty months than cuts in the whole video. One photo per
+        # month is already too many, so something has to give — and what used to
+        # give was the END of the timelapse: every month floored to 1, the
+        # over-allocation trim bailed out (nothing left to trim), and the caller
+        # kept the first `target` selections in date order. A 44-year span
+        # rendered as 1982 through 2020 and simply stopped (#44).
+        #
+        # Drop whole MONTHS instead, sampled evenly across the span, so the
+        # video still travels from the first photo to the last. Fewer months
+        # shown, but the arc survives — which is the point of the thing.
+        keys = list(by_month)
+        chosen: set[int] = set()
+        last = -1
+        for v in np.linspace(0, len(keys) - 1, target):
+            i = min(max(int(round(v)), last + 1), len(keys) - 1)
+            chosen.add(i)
+            last = i
+        selected: list[int] = []
+        log: list[tuple[str, int, int]] = []
+        for i, key in enumerate(keys):
+            bucket = by_month[key]
+            # The middle photo of the month, not the first: months are ordered
+            # within themselves, and the middle is the least likely to sit on a
+            # boundary with the neighbouring month.
+            picks = [bucket[len(bucket) // 2]] if i in chosen else []
+            selected.extend(picks)
+            log.append((f"{key[0]}-{key[1]:02d}", len(picks), len(bucket)))
+        selected.sort()
+        return selected, log
 
     total = sum(len(v) for v in by_month.values())
     raw = {k: len(v) / total * target for k, v in by_month.items()}
