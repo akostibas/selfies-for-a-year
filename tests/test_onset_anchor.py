@@ -2,15 +2,16 @@
 
 Where the beat grid is fiction, cuts follow real note strikes. These cover the
 pure scheduling pieces (no audio): grid-support scoring, span detection, the
-per-strike burst shape, and splicing strike cuts over grid cuts.
+snapped/strike-driven schedulers, and splicing strike cuts over grid cuts.
 """
 import numpy as np
 
 from selfies_for_a_year.beats import (
-    _BURST_FIRST_GAP_S,
-    _BURST_FLOOR_S,
-    _BURST_RATIO,
-    _BURST_TABLE,
+    _MIN_HOLD_S,
+    _SNAP_TOLERANCE_S,
+    _STRIKE_STRIDE,
+    _even_felt_gap,
+    _felt_tier_gaps,
     _grid_support,
     _onset_anchor_cuts,
     _onset_anchor_spans,
@@ -86,78 +87,115 @@ def test_splice_emits_each_strike_once_across_spans():
     assert len(times) == len(set(times)), f"duplicate cut times: {times}"
 
 
-def test_burst_shape_is_identical_at_every_strike():
-    """The point of the burst: the viewer can predict it, so it must not vary.
+def test_even_felt_gap_breaks_ties_toward_the_faster_rung():
+    """The bug behind "the long spacing gets boring" (#46).
 
-    Strikes far enough apart that nothing is damped -- every burst should then be
-    the same geometric fan, anchored on its own strike.
+    "To Build a Home" asks for a photo every 6 beats = 3 felt, exactly between
+    the two legal rungs. Rounding up delivered every 8 — a rate the owner had
+    already rejected as too slow — so ties now round down.
     """
-    strikes = np.array([0.0, 10.0, 20.0])
-    cuts = _onset_anchor_cuts((0.0, 30.0), strikes, lambda t: "intense")
-    ts = np.array([t for t, _ in cuts])
-    _stride, depth = _BURST_TABLE["intense"]
-    assert len(ts) == depth * len(strikes), ts
-    shapes = [np.round(ts[i * depth : (i + 1) * depth] - s, 9)
-              for i, s in enumerate(strikes)]
-    assert all(np.array_equal(shapes[0], s) for s in shapes[1:]), shapes
-    # ...and the shape is a decay, each gap _BURST_RATIO x the last.
-    gaps = np.diff(shapes[0])
-    ratios = gaps[1:] / gaps[:-1]
-    assert np.allclose(ratios, _BURST_RATIO), ratios
+    assert _even_felt_gap(3.0) == 2
+    assert _even_felt_gap(5.0) == 4
+    # ...without disturbing the unambiguous cases.
+    assert _even_felt_gap(3.9) == 4
+    assert _even_felt_gap(2.9) == 2
+    assert _even_felt_gap(6.0) == 6
+    assert _even_felt_gap(0.1) == 2  # never faster than every other felt beat
 
 
-def test_sparse_tiers_keep_their_pre_burst_cadence():
-    """ambient and slow scored well on review, so the burst must not touch them.
-
-    One photo every 2nd (ambient) / 4th (slow) strike, exactly as before bursts
-    existed. Regressing these trades an approved behaviour for an unasked-for one.
-    """
-    strikes = np.arange(0, 20, 1.0)
-    for tier, stride in (("ambient", 2), ("slow", 4)):
-        assert _BURST_TABLE[tier] == (stride, 1), tier
-        cuts = _onset_anchor_cuts((0.0, 20.0), strikes, lambda t, _t=tier: _t)
-        ts = [t for t, _ in cuts]
-        assert all(abs(g - stride) < 1e-6 for g in np.diff(ts)), (tier, ts)
+def test_felt_tier_gaps_keep_the_density_ordering():
+    """intense < normal < slow must survive the even/bar snapping on any grid."""
+    for sub in (1 / 16, 1 / 8, 1 / 6, 1 / 4, 1 / 2, 1.0):
+        for slow_mult in (0.2, 0.33, 0.5, 1.0):
+            g = _felt_tier_gaps(sub, slow_mult)
+            assert g["intense"] < g["normal"] < g["slow"], (sub, slow_mult, g)
+            assert g["ambient"] == g["slow"]
+            assert g["normal"] % 2 == 0
 
 
-def test_next_strike_damps_the_burst():
-    """A re-strike cuts the previous burst short, like damping a piano key.
+def test_anchored_pace_is_the_tier_pace_not_the_note_count():
+    """One rate per tier, both regimes (#46): `normal` cuts every g_normal felt
+    beats inside an anchor span too, however many notes the pianist played."""
+    felt = np.arange(0.0, 30.0, 0.5)
+    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
+    sparse = np.array([0.0, 4.3, 11.7, 22.1])
+    dense = np.arange(0.0, 30.0, 0.31)
+    for strikes in (sparse, dense):
+        cuts = _onset_anchor_cuts(
+            (0.0, 30.0), strikes, lambda t: "normal",
+            felt_beats=felt, felt_gaps=gaps,
+        )
+        ts = np.array([t for t, _ in cuts])
+        # every 2 felt beats = 1.0s, give or take the snap
+        assert abs(np.median(np.diff(ts)) - 1.0) <= _SNAP_TOLERANCE_S, ts
 
-    This is what makes dense passages cut fast and sparse ones settle, without
-    the shape itself changing.
-    """
-    lone = _onset_anchor_cuts((0.0, 30.0), np.array([0.0]), lambda t: "intense")
-    crowded = _onset_anchor_cuts(
-        (0.0, 30.0), np.array([0.0, 0.45, 20.0]), lambda t: "intense"
+
+def test_ticks_land_on_real_notes_when_there_is_one_nearby():
+    """The whole point of snapping: play near the tick and the cut is the note."""
+    felt = np.arange(0.0, 20.0, 0.5)
+    gaps = {"normal": 2}
+    # A strike just inside tolerance of every scheduled tick (every 1.0s).
+    strikes = np.arange(0.0, 20.0, 1.0) + 0.08
+    cuts = _onset_anchor_cuts(
+        (0.0, 20.0), strikes, lambda t: "normal",
+        felt_beats=felt, felt_gaps=gaps,
     )
-    after_first = [t for t, _ in crowded if t < 0.45]
-    assert len(after_first) < len(lone), (after_first, lone)
-    assert after_first[0] == 0.0  # the strike itself still anchors a photo
+    ts = [t for t, _ in cuts]
+    assert all(any(abs(t - s) < 1e-9 for s in strikes) for t in ts), ts
 
 
-def test_no_burst_photo_lands_under_the_legibility_floor():
+def test_ticks_out_of_reach_of_a_note_stay_on_the_beat():
+    """Beyond tolerance the note is a separate event — don't drag the pace to it."""
+    felt = np.arange(0.0, 20.0, 0.5)
+    gaps = {"normal": 2}
+    strikes = np.arange(0.0, 20.0, 1.0) + 0.30  # 300ms out, way past tolerance
+    cuts = _onset_anchor_cuts(
+        (0.0, 20.0), strikes, lambda t: "normal",
+        felt_beats=felt, felt_gaps=gaps,
+    )
+    ts = [t for t, _ in cuts]
+    assert all(any(abs(t - f) < 1e-9 for f in felt) for t in ts), ts
+
+
+def test_lingering_tiers_stay_strike_driven():
+    """ambient and slow reviewed at 5/5 with every cut on an attack; the
+    re-pacing must not put them on the grid, even when a grid is available."""
+    felt = np.arange(0.0, 20.0, 0.5)
+    gaps = {"slow": 4, "ambient": 4, "normal": 2}
+    strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    for tier in ("ambient", "slow"):
+        cuts = _onset_anchor_cuts(
+            (0.0, 20.0), strikes, lambda t, _t=tier: _t,
+            felt_beats=felt, felt_gaps=gaps,
+        )
+        ts = [t for t, _ in cuts]
+        assert ts == list(strikes[:: _STRIKE_STRIDE[tier]]), (tier, ts)
+
+
+def test_lingering_tiers_linger_across_gaps():
+    """A silent gap produces NO cut — we never invent a beat between notes."""
+    strikes = np.array([0.0, 1.0, 2.0, 8.0, 9.0])  # 2s..8s is a 6s gap
+    cuts = _onset_anchor_cuts((0.0, 10.0), strikes, lambda t: "ambient")
+    ts = np.array([t for t, _ in cuts])
+    assert not ((ts > 2.0) & (ts < 8.0)).any(), ts
+
+
+def test_no_cut_lands_under_the_legibility_floor():
     """A hold too brief to register is a wasted selfie -- drop it, don't show it.
 
-    Strikes placed so the decay keeps colliding with the next trigger; every
-    surviving hold must still clear the floor.
+    A tier change mid-span hands off between two schedulers, which is where a
+    pair of near-coincident cuts would otherwise sneak in.
     """
-    strikes = np.array([0.0, 0.42, 0.83, 1.25, 5.0, 5.3])
-    cuts = _onset_anchor_cuts((0.0, 8.0), strikes, lambda t: "normal")
+    felt = np.arange(0.0, 8.0, 0.21)
+    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
+    strikes = np.array([0.0, 0.42, 0.83, 1.25, 1.30, 5.0, 5.05, 5.3])
+    cuts = _onset_anchor_cuts(
+        (0.0, 8.0), strikes, lambda t: "intense" if t < 1.3 else "normal",
+        felt_beats=felt, felt_gaps=gaps,
+    )
     ts = np.array([t for t, _ in cuts])
     holds = np.diff(np.append(ts, 8.0))
-    assert holds.min() >= _BURST_FLOOR_S - 1e-9, sorted(holds)[:5]
-
-
-def test_onset_anchor_cuts_linger_across_gaps():
-    """A silent gap between strikes produces NO cut — we never invent a beat."""
-    strikes = np.array([0.0, 1.0, 2.0, 8.0, 9.0])  # 2s..8s is a 6s gap
-    cuts = _onset_anchor_cuts((0.0, 10.0), strikes, lambda t: "intense")
-    ts = np.array([t for t, _ in cuts])
-    # Every cut sits on a strike or inside that strike's burst; the 2s..8s gap
-    # gets nothing beyond the tail of the burst that the strike at 2.0 fired.
-    burst_end = 2.0 + sum(_BURST_FIRST_GAP_S * _BURST_RATIO**k
-                          for k in range(_BURST_TABLE["intense"][1]))
-    assert not ((ts > burst_end) & (ts < 8.0)).any(), ts
+    assert holds.min() >= _MIN_HOLD_S - 1e-9, sorted(holds)[:5]
 
 
 def test_splice_replaces_only_inside_spans():

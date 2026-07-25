@@ -556,6 +556,49 @@ def _spectral_occupancy(y: np.ndarray, sr: int, hop: int = 512) -> float:
     return float((Sw > (p95 - 30.0)).mean())
 
 
+def _even_felt_gap(raw_felt_gap: float) -> int:
+    """Nearest EVEN felt-beat gap, breaking ties toward the FASTER rung.
+
+    Only even gaps keep the cut on a stable bar position (see
+    _felt_locked_cut_indices), so a song whose target rate lands halfway between
+    two rungs has to be rounded to one of them. Round toward the faster one: the
+    owner has now twice called the slow side boring ("the long spacing gets
+    boring visually", 2026-07-25), and a slightly quick cut still lands on the
+    music where a slow one reads as a stall. Concretely on "To Build a Home":
+    the occupancy ladder asks for a photo every 6 beats (3 felt), which used to
+    round UP to 4 felt = every 8 beats — the exact rate the owner had already
+    rejected as too slow. It now rounds down to 2 felt = every 4."""
+    return max(2, int(np.ceil(raw_felt_gap / 2.0 - 0.5)) * 2)
+
+
+def _felt_tier_gaps(
+    sub: float, slow_mult: float, bar_felt_beats: int = 4
+) -> dict[str, int]:
+    """The pace ladder, stated ONCE, as a whole number of felt beats per photo.
+
+    Every regime reads its rate from here — the beat grid (_felt_locked_cut_
+    indices) and the onset-anchored spans (_onset_anchor_cuts) alike. They used
+    to state it separately, and on "To Build a Home" `normal` came out 13x
+    apart between them (7.8 beats/photo on the grid, 0.6 anchored): the same
+    tier felt dead in one section and frantic in the next. See issue #46."""
+    bar = max(1, int(bar_felt_beats))
+
+    def _raw_felt_gap(mult: float) -> float:
+        if sub <= 0 or mult <= 0:
+            return 1.0
+        return 1.0 / (2.0 * sub * mult)
+
+    g_intense = 1
+    g_normal = _even_felt_gap(_raw_felt_gap(1.0))
+    g_slow = max(bar, int(round(_raw_felt_gap(slow_mult) / bar)) * bar)
+    # Guarantee the density ordering intense < normal < slow survives rounding
+    # (a coarse bar-snap can collapse slow onto normal on some grids).
+    if g_slow <= g_normal:
+        g_slow = ((g_normal // bar) + 1) * bar
+    return {"intense": g_intense, "normal": g_normal, "slow": g_slow,
+            "ambient": g_slow}
+
+
 def _felt_locked_cut_indices(
     n: int,
     intense_mask: np.ndarray,
@@ -591,20 +634,8 @@ def _felt_locked_cut_indices(
     gap on a 4-bar) rotates through EVERY position incl. the weak 2 & 4; even and
     bar-multiple gaps keep gcd>1, so the cut position is stable. Pure and
     deterministic; exercised by tests/test_felt_lock.py."""
-    bar = max(1, int(bar_felt_beats))
-
-    def _raw_felt_gap(mult: float) -> float:
-        if sub <= 0 or mult <= 0:
-            return 1.0
-        return 1.0 / (2.0 * sub * mult)
-
-    g_intense = 1
-    g_normal = max(2, int(round(_raw_felt_gap(1.0) / 2.0)) * 2)
-    g_slow = max(bar, int(round(_raw_felt_gap(slow_mult) / bar)) * bar)
-    # Guarantee the density ordering intense < normal < slow survives rounding
-    # (a coarse bar-snap can collapse slow onto normal on some grids).
-    if g_slow <= g_normal:
-        g_slow = ((g_normal // bar) + 1) * bar
+    gaps = _felt_tier_gaps(sub, slow_mult, bar_felt_beats)
+    g_intense, g_normal, g_slow = gaps["intense"], gaps["normal"], gaps["slow"]
 
     felt_idx = -1
     last_emit: int | None = None
@@ -662,12 +693,15 @@ def _drop_opening_flash(
 # cut on the real onset strikes instead. Regime is decided per region by GRID
 # SUPPORT (fraction of felt beats with a prominent strike within 70ms); a span
 # scoring below _ONSET_ANCHOR_THRESH for at least _ONSET_ANCHOR_MIN_SPAN seconds
-# switches to onset-anchoring. The tier ladder transplants as a per-strike BURST
-# (the chord is the tactus): every `stride`th strike fires `depth` photos that
-# fan out at geometrically growing gaps, so the shape is constant and legible
-# while only the triggers follow the playing. See _BURST_TABLE.
-# Gaps between strikes LINGER — we never interpolate phantom beats.
-# (Design: audio-engineer consult, agent-chat 'audio' Part 5.)
+# switches to onset-anchoring. The PACE does not change with the regime — it is
+# the same felt-beat gap per tier that the grid uses (_felt_tier_gaps) — only
+# where the cuts LAND does: each scheduled tick is pulled onto a real strike if
+# one is within _SNAP_TOLERANCE_S. Where the pianist played near the tick you cut
+# on the note; where they didn't you cut on the beat, and nothing floats between
+# the two. The lingering tiers (slow, ambient) stay purely strike-driven — one
+# photo every Nth note, see _STRIKE_STRIDE — because that cut-on-a-chord-and-hold
+# character is the part that reviewed best.
+# (Design: audio-engineer consult, agent-chat 'audio' Part 5; issue #46.)
 # --------------------------------------------------------------------------- #
 
 _GRID_SUPPORT_WINDOW_S = 0.070   # a felt beat "supports" the grid if a strike is this close
@@ -680,29 +714,22 @@ _ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
 _ONSET_ANCHOR_SONG_GATE = 0.65
 _STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
 
-# Burst decay. A strike doesn't get one photo, it gets a BURST: photos fanning
-# out after the attack at geometrically growing gaps, the way a struck string
-# decays. The shape is identical at every strike, so the viewer learns it and
-# can predict it — which is the whole point. Cutting once per N strikes made the
-# pace track how often the pianist happened to play, and on review that read as
-# "random, not physics based" (product owner, 2026-07-24); only the TRIGGER
-# times should vary with the playing, not the shape.
-#
-# A later strike damps the burst in progress, exactly like re-striking a key.
-# That gives the shape a useful emergent property for free: dense passages
-# truncate into fast cutting, sparse passages get the full decay and settle.
-_BURST_FIRST_GAP_S = 0.150
-_BURST_RATIO = 1.6               # gaps: 150ms, 240ms, 384ms, 614ms
+# How close a scheduled tick has to be to a real note for the cut to move onto
+# the note. Roughly a 16th at 120 BPM: beyond it the "cut" and the "note" are
+# two separate events to the ear, and pulling that far would distort the pace we
+# just committed to. Audio-visual tolerance is asymmetric (picture leading sound
+# is objectionable from ~15ms, lagging fine to ~45ms), but the snap is symmetric
+# because a strike within tolerance IS the event — we land on it, not near it.
+_SNAP_TOLERANCE_S = 0.120
 # A photo held under this reads as a flash, not an image you saw. We shipped a
-# 50ms frame as a bug once; per the project's guiding star, a burst step that
-# can't clear the floor is DROPPED (the previous photo lingers) rather than
-# spent on a frame nobody registers.
-_BURST_FLOOR_S = 0.100
-# (stride, depth) per tier: fire a burst of `depth` photos every `stride`th
-# strike. ambient and slow are UNCHANGED from the one-photo-per-N-strikes era
-# (stride 2 and 4, depth 1) — both scored well on review and the complaints were
-# about the busier tiers, so they keep their sparse, lingering character.
-_BURST_TABLE = {"intense": (1, 4), "normal": (1, 3), "slow": (4, 1), "ambient": (2, 1)}
+# 50ms frame as a bug once; per the project's guiding star, a cut that can't
+# clear the floor is DROPPED (the previous photo lingers) rather than spent on a
+# frame nobody registers.
+_MIN_HOLD_S = 0.100
+# The lingering tiers stay strike-driven: one photo every Nth prominent note,
+# with no grid involved. 92-100% of their cuts land on an attack and the owner
+# rated those sections 5/5, so the re-pacing deliberately does not touch them.
+_STRIKE_STRIDE = {"slow": 4, "ambient": 2}
 
 
 def _prominent_strikes(
@@ -862,45 +889,107 @@ def _onset_anchor_spans(
     return merged
 
 
-def _burst_gaps(depth: int) -> list[float]:
-    """The constant burst shape: `depth` photos, each gap _BURST_RATIO x the last."""
-    return [_BURST_FIRST_GAP_S * _BURST_RATIO**k for k in range(depth)]
+def _tier_stretches(
+    span: tuple[float, float], sel: list[float],
+    tier_at: callable, ambient_default: str,
+) -> list[tuple[tuple[float, float], str]]:
+    """Split a span into contiguous single-tier stretches, bounded by strikes.
+
+    A span can straddle a tier change, and the two tiers are scheduled by
+    different rules (grid-snapped vs strike-driven), so they have to be handed
+    off cleanly rather than interleaved."""
+    t0, t1 = span
+    tiers = [tier_at(s) or ambient_default for s in sel]
+    out: list[tuple[tuple[float, float], str]] = []
+    i = 0
+    while i < len(tiers):
+        j = i
+        while j + 1 < len(tiers) and tiers[j + 1] == tiers[i]:
+            j += 1
+        end = sel[j + 1] if j + 1 < len(sel) else t1
+        out.append(((sel[i], end), tiers[i]))
+        i = j + 1
+    return out
+
+
+def _strike_stride_cuts(
+    stretch: tuple[float, float], sel: list[float], tier: str
+) -> list[tuple[float, str]]:
+    """One photo every Nth prominent note — no grid, so gaps between notes
+    LINGER and every cut is on an attack. Used for the lingering tiers, and for
+    everything when there is no felt grid to schedule against (stride 1 there:
+    with no rate to hold to, the notes are the only pace available)."""
+    a, b = stretch
+    stride = max(1, _STRIKE_STRIDE.get(tier, 1))
+    inside = [s for s in sel if a - 1e-9 <= s < b - 1e-9]
+    return [(s, tier) for s in inside[::stride]]
+
+
+def _snapped_cuts(
+    stretch: tuple[float, float], sel: list[float], tier: str,
+    felt_beats: np.ndarray, felt_gaps: dict[str, int],
+) -> list[tuple[float, str]]:
+    """The tier's own felt-beat rate, with each tick pulled onto a real note if
+    one is within _SNAP_TOLERANCE_S.
+
+    This is the way out of the bind the owner named: "the long spacing gets
+    boring visually, but random photo flipping doesn't seem to solve the
+    problem". Counting notes made the pace track how often the pianist happened
+    to play; scheduling on the grid alone put cuts on nothing. Scheduling on the
+    grid and landing on the notes that are there does both."""
+    a, b = stretch
+    gap = max(1, int(felt_gaps.get(tier, 2)))
+    fb = felt_beats[(felt_beats >= a - _SNAP_TOLERANCE_S) & (felt_beats < b)]
+    out: list[tuple[float, str]] = []
+    used: set[float] = set()
+    for i in range(0, len(fb), gap):
+        tick = float(fb[i])
+        cand = [s for s in sel
+                if abs(s - tick) <= _SNAP_TOLERANCE_S and s not in used
+                and a - 1e-9 <= s < b]
+        t = min(cand, key=lambda s: abs(s - tick)) if cand else tick
+        if t < a - 1e-9 or t >= b:
+            continue
+        used.add(t)
+        out.append((t, tier))
+    return out
 
 
 def _onset_anchor_cuts(
     span: tuple[float, float], strikes: np.ndarray,
-    tier_at: callable, ambient_default: str = "slow",
+    tier_at: callable, ambient_default: str = "slow", *,
+    felt_beats: np.ndarray | None = None,
+    felt_gaps: dict[str, int] | None = None,
 ) -> list[tuple[float, str]]:
-    """Cut times inside an onset-anchor span: every `stride`th prominent strike
-    triggers a burst of `depth` photos at geometrically growing gaps (see
-    _BURST_TABLE). The next trigger DAMPS an unfinished burst. Strike gaps
-    LINGER — we never interpolate phantom beats, so the last photo of a burst
-    simply holds until the next strike. Pure; exercised by
-    tests/test_onset_anchor.py."""
+    """Cut times inside an onset-anchor span, at the tier's normal pace.
+
+    Busy tiers ride the felt-beat grid and snap onto real notes; the lingering
+    tiers count notes instead (see _snapped_cuts / _strike_stride_cuts). Without
+    a felt grid to schedule against, everything falls back to counting notes.
+    Pure; exercised by tests/test_onset_anchor.py."""
     t0, t1 = span
     sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    if not sel:
+        return []
+    has_grid = felt_beats is not None and felt_gaps is not None and len(felt_beats)
     out: list[tuple[float, str]] = []
-    i = 0
-    while i < len(sel):
-        tier = tier_at(sel[i]) or ambient_default
-        stride, depth = _BURST_TABLE.get(tier, (2, 1))
-        stride = max(1, stride)
-        # The burst is damped by whatever comes next: the following trigger, or
-        # the span edge (where grid cuts resume).
-        nxt = sel[i + stride] if i + stride < len(sel) else t1
-        c = sel[i]
-        for gap in _burst_gaps(depth):
-            if c >= nxt - 1e-9:
-                break
-            # Realized hold: the step's own gap, or whatever the damping event
-            # leaves, whichever is shorter. Too brief to register -> don't spend
-            # a photo on it; hold the previous one through instead.
-            if min(c + gap, nxt) - c < _BURST_FLOOR_S - 1e-9:
-                break
-            out.append((c, tier))
-            c += gap
-        i += stride
-    return out
+    for stretch, tier in _tier_stretches(span, sel, tier_at, ambient_default):
+        if tier in _STRIKE_STRIDE or not has_grid:
+            out.extend(_strike_stride_cuts(stretch, sel, tier))
+        else:
+            out.extend(_snapped_cuts(stretch, sel, tier, felt_beats, felt_gaps))
+    # Snapping and the stretch hand-offs can put two cuts within a frame of each
+    # other; a hold nobody registers is a wasted photo, so drop the later one.
+    # The span edge counts too: grid cutting resumes at t1, so a cut just inside
+    # it would flash. Drop it and let the last photo run into the boundary.
+    out = [(t, k) for t, k in out if t <= t1 - _MIN_HOLD_S + 1e-9]
+    out.sort(key=lambda tk: tk[0])
+    deduped: list[tuple[float, str]] = []
+    for t, tier in out:
+        if deduped and t - deduped[-1][0] < _MIN_HOLD_S - 1e-9:
+            continue
+        deduped.append((t, tier))
+    return deduped
 
 
 def _splice_onset_anchor(
@@ -909,6 +998,8 @@ def _splice_onset_anchor(
     strikes: np.ndarray,
     tier_at: callable,
     heights: np.ndarray | None = None,
+    felt_beats: np.ndarray | None = None,
+    felt_gaps: dict[str, int] | None = None,
 ) -> list[tuple[float, str]]:
     """Replace grid transitions inside onset-anchor spans with strike-anchored
     cuts, leaving grid spans untouched. Strikes are coalesced PER SPAN (a fast
@@ -927,7 +1018,10 @@ def _splice_onset_anchor(
         t0, t1 = span
         m = (strikes >= t0 - 1e-6) & (strikes < t1 + 1e-6)
         span_strikes = _coalesce_strikes(strikes[m], heights[m])
-        kept.extend(_onset_anchor_cuts(span, span_strikes, tier_at))
+        kept.extend(_onset_anchor_cuts(
+            span, span_strikes, tier_at,
+            felt_beats=felt_beats, felt_gaps=felt_gaps,
+        ))
     kept.sort(key=lambda tk: tk[0])
     return kept
 
@@ -2093,8 +2187,19 @@ def build_timeline(
                     return "ambient"
             return "normal"
 
+        # Anchored spans re-pace at the SAME felt-beat gaps the grid uses, so a
+        # tier sounds like itself in both regimes (issue #46). Without the felt
+        # lock there is no felt grid to schedule against, and the anchored spans
+        # fall back to counting notes.
+        anchor_gaps = (
+            _felt_tier_gaps(subdivision, slow_multiplier)
+            if cut_felt_parity is not None else None
+        )
         transitions = _splice_onset_anchor(
-            transitions, anchor_spans, onset_strikes, _tier_at_time, onset_strike_heights
+            transitions, anchor_spans, onset_strikes, _tier_at_time,
+            onset_strike_heights,
+            felt_beats=felt_for_support if anchor_gaps else None,
+            felt_gaps=anchor_gaps,
         )
         onset_anchor_spans_final = anchor_spans
         # The splice may have removed the t=0 start (it sits inside the intro
