@@ -2,12 +2,15 @@
 
 Where the beat grid is fiction, cuts follow real note strikes. These cover the
 pure scheduling pieces (no audio): grid-support scoring, span detection, the
-photos-per-strike cadence, and splicing strike cuts over grid cuts.
+per-strike burst shape, and splicing strike cuts over grid cuts.
 """
 import numpy as np
 
 from selfies_for_a_year.beats import (
-    _PHOTOS_PER_STRIKE,
+    _BURST_FIRST_GAP_S,
+    _BURST_FLOOR_S,
+    _BURST_RATIO,
+    _BURST_TABLE,
     _grid_support,
     _onset_anchor_cuts,
     _onset_anchor_spans,
@@ -83,23 +86,78 @@ def test_splice_emits_each_strike_once_across_spans():
     assert len(times) == len(set(times)), f"duplicate cut times: {times}"
 
 
-def test_photos_per_strike_cadence():
-    strikes = np.arange(0, 10, 1.0)  # a strike every second, 10 total
-    span = (0.0, 10.0)
-    for tier, step in _PHOTOS_PER_STRIKE.items():
-        cuts = _onset_anchor_cuts(span, strikes, lambda t, _tier=tier: _tier)
-        # consecutive cuts are `step` strikes (=`step` seconds here) apart
+def test_burst_shape_is_identical_at_every_strike():
+    """The point of the burst: the viewer can predict it, so it must not vary.
+
+    Strikes far enough apart that nothing is damped -- every burst should then be
+    the same geometric fan, anchored on its own strike.
+    """
+    strikes = np.array([0.0, 10.0, 20.0])
+    cuts = _onset_anchor_cuts((0.0, 30.0), strikes, lambda t: "intense")
+    ts = np.array([t for t, _ in cuts])
+    _stride, depth = _BURST_TABLE["intense"]
+    assert len(ts) == depth * len(strikes), ts
+    shapes = [np.round(ts[i * depth : (i + 1) * depth] - s, 9)
+              for i, s in enumerate(strikes)]
+    assert all(np.array_equal(shapes[0], s) for s in shapes[1:]), shapes
+    # ...and the shape is a decay, each gap _BURST_RATIO x the last.
+    gaps = np.diff(shapes[0])
+    ratios = gaps[1:] / gaps[:-1]
+    assert np.allclose(ratios, _BURST_RATIO), ratios
+
+
+def test_sparse_tiers_keep_their_pre_burst_cadence():
+    """ambient and slow scored well on review, so the burst must not touch them.
+
+    One photo every 2nd (ambient) / 4th (slow) strike, exactly as before bursts
+    existed. Regressing these trades an approved behaviour for an unasked-for one.
+    """
+    strikes = np.arange(0, 20, 1.0)
+    for tier, stride in (("ambient", 2), ("slow", 4)):
+        assert _BURST_TABLE[tier] == (stride, 1), tier
+        cuts = _onset_anchor_cuts((0.0, 20.0), strikes, lambda t, _t=tier: _t)
         ts = [t for t, _ in cuts]
-        gaps = np.diff(ts)
-        assert all(abs(g - step) < 1e-6 for g in gaps), (tier, ts)
+        assert all(abs(g - stride) < 1e-6 for g in np.diff(ts)), (tier, ts)
+
+
+def test_next_strike_damps_the_burst():
+    """A re-strike cuts the previous burst short, like damping a piano key.
+
+    This is what makes dense passages cut fast and sparse ones settle, without
+    the shape itself changing.
+    """
+    lone = _onset_anchor_cuts((0.0, 30.0), np.array([0.0]), lambda t: "intense")
+    crowded = _onset_anchor_cuts(
+        (0.0, 30.0), np.array([0.0, 0.45, 20.0]), lambda t: "intense"
+    )
+    after_first = [t for t, _ in crowded if t < 0.45]
+    assert len(after_first) < len(lone), (after_first, lone)
+    assert after_first[0] == 0.0  # the strike itself still anchors a photo
+
+
+def test_no_burst_photo_lands_under_the_legibility_floor():
+    """A hold too brief to register is a wasted selfie -- drop it, don't show it.
+
+    Strikes placed so the decay keeps colliding with the next trigger; every
+    surviving hold must still clear the floor.
+    """
+    strikes = np.array([0.0, 0.42, 0.83, 1.25, 5.0, 5.3])
+    cuts = _onset_anchor_cuts((0.0, 8.0), strikes, lambda t: "normal")
+    ts = np.array([t for t, _ in cuts])
+    holds = np.diff(np.append(ts, 8.0))
+    assert holds.min() >= _BURST_FLOOR_S - 1e-9, sorted(holds)[:5]
 
 
 def test_onset_anchor_cuts_linger_across_gaps():
     """A silent gap between strikes produces NO cut — we never invent a beat."""
     strikes = np.array([0.0, 1.0, 2.0, 8.0, 9.0])  # 2s..8s is a 6s gap
-    cuts = _onset_anchor_cuts((0.0, 10.0), strikes, lambda t: "intense")  # every strike
-    ts = [t for t, _ in cuts]
-    assert ts == [0.0, 1.0, 2.0, 8.0, 9.0]  # cut on each strike, nothing in the gap
+    cuts = _onset_anchor_cuts((0.0, 10.0), strikes, lambda t: "intense")
+    ts = np.array([t for t, _ in cuts])
+    # Every cut sits on a strike or inside that strike's burst; the 2s..8s gap
+    # gets nothing beyond the tail of the burst that the strike at 2.0 fired.
+    burst_end = 2.0 + sum(_BURST_FIRST_GAP_S * _BURST_RATIO**k
+                          for k in range(_BURST_TABLE["intense"][1]))
+    assert not ((ts > burst_end) & (ts < 8.0)).any(), ts
 
 
 def test_splice_replaces_only_inside_spans():
@@ -107,8 +165,10 @@ def test_splice_replaces_only_inside_spans():
     strikes = np.array([0.5, 5.5, 10.5])
     spans = [(0.0, 8.0)]
     out = _splice_onset_anchor(grid, spans, strikes, lambda t: "intense")
-    # grid cuts in [0,8) gone; strike cuts (0.5, 5.5) present; grid cuts >=8 kept
+    # grid cuts in [0,8) gone; the strikes there anchor bursts; grid cuts >=8 kept
     times = [t for t, _ in out]
     assert 0.5 in times and 5.5 in times
-    assert not any(0 <= t < 8 and t not in (0.5, 5.5) for t in times)
+    inside = [t for t in times if 0 <= t < 8]
+    assert not any(abs(t - round(t)) < 1e-9 for t in inside), inside  # no grid cut left
+    assert all(0.5 <= t < 0.5 + 2 or 5.5 <= t < 5.5 + 2 for t in inside), inside
     assert 10.0 in times and 15.0 in times  # untouched grid outside the span

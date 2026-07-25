@@ -662,9 +662,11 @@ def _drop_opening_flash(
 # cut on the real onset strikes instead. Regime is decided per region by GRID
 # SUPPORT (fraction of felt beats with a prominent strike within 70ms); a span
 # scoring below _ONSET_ANCHOR_THRESH for at least _ONSET_ANCHOR_MIN_SPAN seconds
-# switches to onset-anchoring. The tier ladder transplants as photos-per-STRIKE
-# (the chord is the tactus): intense=every strike, normal=every 2nd, slow=every
-# 4th. Gaps between strikes LINGER — we never interpolate phantom beats.
+# switches to onset-anchoring. The tier ladder transplants as a per-strike BURST
+# (the chord is the tactus): every `stride`th strike fires `depth` photos that
+# fan out at geometrically growing gaps, so the shape is constant and legible
+# while only the triggers follow the playing. See _BURST_TABLE.
+# Gaps between strikes LINGER — we never interpolate phantom beats.
 # (Design: audio-engineer consult, agent-chat 'audio' Part 5.)
 # --------------------------------------------------------------------------- #
 
@@ -677,11 +679,30 @@ _ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
 # overall ambiguous/rubato (a ballad with a sparse intro) get per-section anchoring.
 _ONSET_ANCHOR_SONG_GATE = 0.65
 _STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
-# Photos per strike by tier. Strikes are already sparse (~2s apart in a rubato
-# intro), so ambient cuts every 2nd strike rather than every 4th — every-4th
-# would leave a >10s opening hold. slow stays deliberately sparse for a
-# breakdown; intense cuts every strike.
-_PHOTOS_PER_STRIKE = {"intense": 1, "normal": 2, "slow": 4, "ambient": 2}
+
+# Burst decay. A strike doesn't get one photo, it gets a BURST: photos fanning
+# out after the attack at geometrically growing gaps, the way a struck string
+# decays. The shape is identical at every strike, so the viewer learns it and
+# can predict it — which is the whole point. Cutting once per N strikes made the
+# pace track how often the pianist happened to play, and on review that read as
+# "random, not physics based" (product owner, 2026-07-24); only the TRIGGER
+# times should vary with the playing, not the shape.
+#
+# A later strike damps the burst in progress, exactly like re-striking a key.
+# That gives the shape a useful emergent property for free: dense passages
+# truncate into fast cutting, sparse passages get the full decay and settle.
+_BURST_FIRST_GAP_S = 0.150
+_BURST_RATIO = 1.6               # gaps: 150ms, 240ms, 384ms, 614ms
+# A photo held under this reads as a flash, not an image you saw. We shipped a
+# 50ms frame as a bug once; per the project's guiding star, a burst step that
+# can't clear the floor is DROPPED (the previous photo lingers) rather than
+# spent on a frame nobody registers.
+_BURST_FLOOR_S = 0.100
+# (stride, depth) per tier: fire a burst of `depth` photos every `stride`th
+# strike. ambient and slow are UNCHANGED from the one-photo-per-N-strikes era
+# (stride 2 and 4, depth 1) — both scored well on review and the complaints were
+# about the busier tiers, so they keep their sparse, lingering character.
+_BURST_TABLE = {"intense": (1, 4), "normal": (1, 3), "slow": (4, 1), "ambient": (2, 1)}
 
 
 def _prominent_strikes(
@@ -834,23 +855,44 @@ def _onset_anchor_spans(
     return merged
 
 
+def _burst_gaps(depth: int) -> list[float]:
+    """The constant burst shape: `depth` photos, each gap _BURST_RATIO x the last."""
+    return [_BURST_FIRST_GAP_S * _BURST_RATIO**k for k in range(depth)]
+
+
 def _onset_anchor_cuts(
     span: tuple[float, float], strikes: np.ndarray,
     tier_at: callable, ambient_default: str = "slow",
 ) -> list[tuple[float, str]]:
-    """Cut times inside an onset-anchor span: emit on prominent strikes at the
-    tier's photos-per-strike cadence (intense=every strike, normal=every 2nd,
-    slow/ambient=every 4th). Strike gaps LINGER (no phantom beats). Pure;
-    exercised by tests/test_onset_anchor.py."""
+    """Cut times inside an onset-anchor span: every `stride`th prominent strike
+    triggers a burst of `depth` photos at geometrically growing gaps (see
+    _BURST_TABLE). The next trigger DAMPS an unfinished burst. Strike gaps
+    LINGER — we never interpolate phantom beats, so the last photo of a burst
+    simply holds until the next strike. Pure; exercised by
+    tests/test_onset_anchor.py."""
     t0, t1 = span
     sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
     out: list[tuple[float, str]] = []
     i = 0
     while i < len(sel):
         tier = tier_at(sel[i]) or ambient_default
-        out.append((sel[i], tier))
-        step = _PHOTOS_PER_STRIKE.get(tier, 2)
-        i += max(1, step)
+        stride, depth = _BURST_TABLE.get(tier, (2, 1))
+        stride = max(1, stride)
+        # The burst is damped by whatever comes next: the following trigger, or
+        # the span edge (where grid cuts resume).
+        nxt = sel[i + stride] if i + stride < len(sel) else t1
+        c = sel[i]
+        for gap in _burst_gaps(depth):
+            if c >= nxt - 1e-9:
+                break
+            # Realized hold: the step's own gap, or whatever the damping event
+            # leaves, whichever is shorter. Too brief to register -> don't spend
+            # a photo on it; hold the previous one through instead.
+            if min(c + gap, nxt) - c < _BURST_FLOOR_S - 1e-9:
+                break
+            out.append((c, tier))
+            c += gap
+        i += stride
     return out
 
 
