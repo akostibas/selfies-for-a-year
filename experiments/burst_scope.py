@@ -47,13 +47,84 @@ TIER_RGB = {"ambient": (150, 150, 150), "slow": (90, 200, 110),
 ON_STRIKE_EPS = 1e-6
 
 
-def instrumented_timeline(path: Path, n_photos: int = 1158):
+def interval_burst(span, strikes, tier_at, ambient_default="slow"):
+    """Candidate: scale the burst to the gap it has to fill, instead of fixed ms.
+
+    The shipped burst uses absolute gaps (150/240/384ms), so it front-loads a
+    flurry and then waits out however much of the note is left -- and the wait
+    has no relationship to anything. Here the same geometric decay is stretched
+    so its gaps SUM to the interval before the next trigger: the last and
+    longest photo resolves exactly as the next note lands.
+
+    Consequences worth judging on the plot:
+      * the shape is self-similar -- every note gets the same proportional fan,
+        so a slow passage decays slowly and a busy one decays fast, from one rule
+      * long gaps stop being dead air; they get the same `depth` photos, just
+        spread wide, which is what should fix the 24-34s hole
+      * cuts sit at fixed PHASE positions within each note (0, ~19%, ~50%), so
+        they stay tied to the music even when they aren't on the attack itself
+    """
+    t0, t1 = span
+    sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    out: list[tuple[float, str]] = []
+    i = 0
+    r = B._BURST_RATIO
+    while i < len(sel):
+        tier = tier_at(sel[i]) or ambient_default
+        stride, depth = B._BURST_TABLE.get(tier, (2, 1))
+        stride = max(1, stride)
+        nxt = sel[i + stride] if i + stride < len(sel) else t1
+        interval = nxt - sel[i]
+        # gaps g0*r^k for k<depth summing to `interval`
+        g0 = interval * (r - 1) / (r**depth - 1) if depth > 1 else interval
+        c = sel[i]
+        for k in range(depth):
+            gap = g0 * r**k
+            if gap < B._BURST_FLOOR_S - 1e-9:
+                break  # too brief to register -- hold the previous photo instead
+            out.append((c, tier))
+            c += gap
+        i += stride
+    return out
+
+
+def one_per_strike(span, strikes, tier_at, ambient_default="slow"):
+    """Candidate: no burst at all in the busy tiers -- one photo per strike.
+
+    The other half of what was asked for: "a well timed constant cut rate". Every
+    cut is on an attack by construction, which is the one property the two
+    sections rated 5/5 share (92% and 100% on-strike, against 36% in the section
+    that was rejected). Pace still follows the playing -- a busy passage cuts
+    fast -- but nothing floats between the notes.
+
+    Cheaper than it sounds: normal currently spends ~2.8 photos per strike, so
+    dropping to 1 costs less pace than the depth suggests, because those extra
+    photos are crammed into the same interval rather than covering new ground.
+    """
+    t0, t1 = span
+    sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    out: list[tuple[float, str]] = []
+    i = 0
+    while i < len(sel):
+        tier = tier_at(sel[i]) or ambient_default
+        # ambient/slow keep their sparse stride; the busy tiers cut every strike
+        stride = {"ambient": 2, "slow": 4}.get(tier, 1)
+        out.append((sel[i], tier))
+        i += stride
+    return out
+
+
+MODES = {"fixed": None, "interval": interval_burst, "onstrike": one_per_strike}
+
+
+def instrumented_timeline(path: Path, n_photos: int = 1158, mode: str = "fixed"):
     """Run the real pipeline, recording what each anchor span was handed."""
     calls: list[dict] = []
     orig = B._onset_anchor_cuts
+    impl = MODES[mode] or orig
 
     def spy(span, strikes, tier_at, ambient_default="slow"):
-        out = orig(span, strikes, tier_at, ambient_default)
+        out = impl(span, strikes, tier_at, ambient_default)
         calls.append({
             "span": span,
             "strikes": np.asarray(strikes, dtype=float),  # already coalesced
@@ -215,13 +286,15 @@ def main(argv):
     path = Path(argv[0]).expanduser()
     t0 = float(argv[1]) if len(argv) > 1 else 21.0
     win = float(argv[2]) if len(argv) > 2 else 25.0
-    tl, calls = instrumented_timeline(path)
+    mode = argv[3] if len(argv) > 3 else "fixed"
+    tl, calls = instrumented_timeline(path, mode=mode)
     starts, durs, tiers, kinds, _ = classify(tl, calls)
-    print(f"{path.stem}: {len(tl.segments)} photos / {tl.total_duration:.0f}s = "
-          f"{len(tl.segments) / tl.total_duration:.2f}/s, "
+    print(f"[{mode}] {path.stem}: {len(tl.segments)} photos / "
+          f"{tl.total_duration:.0f}s = {len(tl.segments) / tl.total_duration:.2f}/s, "
           f"{len(calls)} anchor spans")
     report(starts, durs, tiers, kinds, calls, tl.total_duration)
-    out = f"/tmp/burst_scope_{path.stem[:12].replace(' ', '_')}_{t0:.0f}s.png"
+    out = (f"/tmp/burst_scope_{path.stem[:12].replace(' ', '_')}"
+           f"_{mode}_{t0:.0f}s.png")
     plot(path, tl, calls, starts, durs, tiers, kinds, t0, t0 + win, out)
 
 

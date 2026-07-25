@@ -711,7 +711,15 @@ def _prominent_strikes(
     """Peak-picked onset attacks (the note/chord strikes), returned as
     (times, heights). Height is read at the PEAK; a strike survives when it
     exceeds prom_frac of the local-p90 envelope (drops ornaments, keeps chords).
-    Times are BACKTRACKED to the attack start so a cut on them reads on-the-hit.
+
+    Times are the ENVELOPE PEAK, not librosa's backtracked attack start. We used
+    to backtrack, on the theory that the foot of the rise is where the note
+    begins -- but that put cuts a median 46ms (p90 93ms) BEFORE the audible
+    attack, and on review the picture visibly led the sound: "the image flipping
+    is a bit early, making the effect not feel connected". Audio-visual
+    tolerance is strongly asymmetric -- picture leading sound is objectionable
+    from roughly 15ms, picture lagging is fine to about 45ms -- so landing on
+    the peak, and erring late if at all, is the safe side to miss on.
 
     NOT coalesced: this is the raw strike set used to MEASURE grid support, and
     at a fast tempo (144 BPM = a beat every 0.42s) merging near-together strikes
@@ -724,16 +732,15 @@ def _prominent_strikes(
     peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, backtrack=False)
     if len(peaks) == 0:
         return np.array([]), np.array([])
-    back = librosa.onset.onset_backtrack(peaks, env)
     hop = 512
     w = max(1, int(rolling_s * sr / hop))
     times, heights = [], []
-    for pk, bk in zip(peaks, back):
+    for pk in peaks:
         lo, hi = max(0, pk - w), min(len(env), pk + w)
         p90 = float(np.percentile(env[lo:hi], 90))
         h = float(env[min(pk, len(env) - 1)])
         if h >= prom_frac * p90:
-            times.append(float(librosa.frames_to_time(bk, sr=sr)))
+            times.append(float(librosa.frames_to_time(pk, sr=sr)))
             heights.append(h)
     return np.asarray(times), np.asarray(heights)
 
