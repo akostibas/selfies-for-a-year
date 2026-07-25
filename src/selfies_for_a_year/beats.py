@@ -853,24 +853,29 @@ def _strike_stride_cuts(
 
 def _onset_anchor_cuts(
     span: tuple[float, float], strikes: np.ndarray,
-    tier_at: callable, ambient_default: str = "ambient", *,
-    has_grid: bool = False,
+    tier_at: callable, grid_cuts=(), ambient_default: str = "ambient",
 ) -> list[tuple[float, str]]:
     """Strike-driven cut times inside an onset-anchor span.
 
-    Only the note-driven stretches produce cuts here: ambient (see
-    _NOTE_DRIVEN_TIERS), and — when the song has no felt grid at all — every
-    tier, since there is then no metronomic pulse to fall back on. Intense,
-    normal and slow keep their felt-grid cuts through the span; the splice retains
-    those rather than replacing them, so they stay metronome-locked. Pure;
+    A stretch produces note-following cuts when it is ambient (see
+    _NOTE_DRIVEN_TIERS) OR when no retained grid cut covers it — the latter is the
+    beyond-the-last-beat / no-felt-grid case, where there is no metronomic pulse
+    to fall back on. Intense, normal and slow stretches that ARE covered by grid
+    cuts emit nothing here; the splice keeps their metronomic cuts. `grid_cuts`
+    are the grid transition times the splice retained inside this span. Pure;
     exercised by tests/test_onset_anchor.py."""
     t0, t1 = span
     sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
     if not sel:
         return []
+    grid_cuts = np.asarray(grid_cuts, dtype=float)
     out: list[tuple[float, str]] = []
     for stretch, tier in _tier_stretches(span, sel, tier_at, ambient_default):
-        if tier in _NOTE_DRIVEN_TIERS or not has_grid:
+        a, b = stretch
+        covered = bool(len(grid_cuts)) and bool(
+            np.any((grid_cuts >= a - 1e-9) & (grid_cuts < b))
+        )
+        if tier in _NOTE_DRIVEN_TIERS or not covered:
             out.extend(_strike_stride_cuts(stretch, sel, tier))
         # else: the metronomic grid cuts are kept by the splice; emit nothing.
     # The stretch hand-offs can put two cuts within a frame of each other; a hold
@@ -910,18 +915,23 @@ def _splice_onset_anchor(
     def _in_span(t: float) -> bool:
         return any(t0 <= t < t1 for t0, t1 in spans)
 
-    def _replaced(t: float, kind: str) -> bool:
+    def _replaced(t: float) -> bool:
         # A grid cut is dropped only where a strike-driven cut will take its place:
-        # note-driven tiers, or everything when there is no grid to hold onto.
-        return _in_span(t) and (not has_grid or kind in _NOTE_DRIVEN_TIERS)
+        # ambient-TIER stretches (decided by region via tier_at, NOT the per-beat
+        # `kind` — a quiet outro beat is labelled kind="ambient" yet still belongs
+        # to an intense/slow region), or everything when there is no felt grid.
+        return _in_span(t) and (not has_grid or tier_at(t) in _NOTE_DRIVEN_TIERS)
 
-    kept = [(t, k) for (t, k) in transitions if not _replaced(t, k)]
+    kept = [(t, k) for (t, k) in transitions if not _replaced(t)]
     for span in spans:
         t0, t1 = span
         m = (strikes >= t0 - 1e-6) & (strikes < t1 + 1e-6)
         span_strikes = _coalesce_strikes(strikes[m], heights[m])
+        # The metronome cuts that survived inside this span; they cover their
+        # stretches so the filler leaves those alone and only fills the rest.
+        grid_in_span = [t for (t, _k) in kept if t0 <= t < t1]
         kept.extend(_onset_anchor_cuts(
-            span, span_strikes, tier_at, has_grid=has_grid,
+            span, span_strikes, tier_at, grid_cuts=grid_in_span,
         ))
     kept.sort(key=lambda tk: tk[0])
     return kept

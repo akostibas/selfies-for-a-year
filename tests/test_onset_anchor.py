@@ -82,38 +82,40 @@ def test_felt_tier_gaps_is_the_fixed_metronomic_ladder():
 
 
 def test_ambient_stays_strike_driven_even_with_a_grid():
-    """Ambient reviewed at 5/5 following the actual notes; a grid being available
-    must not pull it onto the metronome."""
+    """Ambient reviewed at 5/5 following the actual notes; a grid covering the
+    span must not pull it onto the metronome."""
     strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    grid = np.arange(0.0, 20.0, 1.0)  # a full metronome grid over the span
     cuts = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "ambient", has_grid=True,
+        (0.0, 20.0), strikes, lambda t: "ambient", grid_cuts=grid,
     )
     ts = [t for t, _ in cuts]
     assert ts == list(strikes[:: _STRIKE_STRIDE["ambient"]]), ts
     assert _NOTE_DRIVEN_TIERS == frozenset({"ambient"})
 
 
-def test_metronome_tiers_emit_no_anchor_cuts_when_a_grid_exists():
-    """intense/normal/slow keep their felt-grid pulse through a span, so the
-    anchor scheduler emits nothing for them — the splice retains the grid cuts."""
+def test_metronome_tiers_emit_no_anchor_cuts_when_grid_covers_them():
+    """intense/normal/slow keep their felt-grid pulse through a span, so where a
+    retained grid cut covers the stretch the filler emits nothing."""
     strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    grid = np.arange(0.0, 20.0, 1.0)
     for tier in ("intense", "normal", "slow"):
         cuts = _onset_anchor_cuts(
-            (0.0, 20.0), strikes, lambda t, _t=tier: _t, has_grid=True,
+            (0.0, 20.0), strikes, lambda t, _t=tier: _t, grid_cuts=grid,
         )
         assert cuts == [], (tier, cuts)
 
 
-def test_without_a_grid_every_tier_note_counts():
-    """A song with no felt grid at all has no metronome to fall back on, so every
-    tier follows the notes at its stride (slow lingers, normal takes each note)."""
+def test_uncovered_stretches_note_count_as_a_fallback():
+    """No grid cut covering a stretch (past the last beat, or no felt grid at all)
+    -> every tier follows the notes at its stride, so no silent gap opens up."""
     strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
     slow = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "slow", has_grid=False,
+        (0.0, 20.0), strikes, lambda t: "slow", grid_cuts=(),
     )
     assert [t for t, _ in slow] == list(strikes[:: _STRIKE_STRIDE["slow"]])
     normal = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "normal", has_grid=False,
+        (0.0, 20.0), strikes, lambda t: "normal", grid_cuts=(),
     )
     assert [t for t, _ in normal] == list(strikes)  # stride 1 default
 
@@ -131,7 +133,7 @@ def test_no_cut_lands_under_the_legibility_floor():
     Near-coincident strikes must not produce a sub-floor flash."""
     strikes = np.array([0.0, 0.05, 1.0, 1.03, 5.0, 5.3])  # some pairs within a frame
     cuts = _onset_anchor_cuts(
-        (0.0, 8.0), strikes, lambda t: "ambient", has_grid=False,
+        (0.0, 8.0), strikes, lambda t: "ambient", grid_cuts=(),
     )
     ts = np.array([t for t, _ in cuts])
     holds = np.diff(np.append(ts, 8.0))
