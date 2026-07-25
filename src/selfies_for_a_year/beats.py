@@ -1451,6 +1451,36 @@ def _pace_rolling_p80(x: np.ndarray, win: int = 16) -> np.ndarray:
     return out
 
 
+def _pace_dynamics_weight(loud_beat: np.ndarray) -> float:
+    """How far to trust this track's loudness as an intensity signal, in [0, 1].
+
+    The interquartile spread of per-beat loudness: 1.0 for a track with real
+    dynamics, ~0 for a compressed one where every section measures the same. Two
+    terms key off it in OPPOSITE directions — loudness is weighted by it, and the
+    modulation-depth fallback by (1 - it) — so exactly one of them decides any
+    given track.
+    """
+    iqr_db = float(np.percentile(loud_beat, 75) - np.percentile(loud_beat, 25))
+    return float(np.clip((iqr_db - 3.0) / 6.0, 0.0, 1.0))
+
+
+def _pace_depth_boost(loud_beat: np.ndarray, ceiling: float) -> float:
+    """Effective weight for the modulation-depth fallback on this track.
+
+    Loudness and texture are ALTERNATIVE intensity reads, not complementary ones,
+    so hold the fallback at full strength until loudness is clearly the better
+    read, then ramp it off — rather than blending, which leaves a middling track
+    scored well by neither. In loudness-spread terms: full fallback below 6 dB
+    between the quartiles, none above 9 dB, linear across.
+
+    Blending was tried first and rejected: it took Push Upstairs from 0.6 to 0.43,
+    enough to tip a section already sitting on a tier boundary into a spurious
+    "intense" at 2:09 that ate 37 photos and starved 16s off an approved render.
+    """
+    w = _pace_dynamics_weight(loud_beat)
+    return ceiling * float(np.clip(2.0 * (1.0 - w), 0.0, 1.0))
+
+
 def _pace_tiers_segment(
     audio_path: Path,
     beat_times: np.ndarray,
@@ -1467,7 +1497,10 @@ def _pace_tiers_segment(
        MFCC, modulation depth) -> cosine SSM -> Foote novelty -> segment cuts.
     2. Per-beat energy = cyan height + variance-gated loudness booster, plus a
        modulation-depth boost that rescues burst trains (median energy sits in
-       the gaps; depth is high there).
+       the gaps; depth is high there). Both extra terms are gated on the track's
+       loudness spread, in opposite directions: a track with real dynamics is
+       scored on them, a compressed one falls back to texture. `depth_boost` is
+       the ceiling on that fallback, reached only when the track is fully flat.
     3. Mode-anchored tier centers over the per-beat combined signal; each SEGMENT
        labelled by the nearest center to its median.
     """
@@ -1505,10 +1538,18 @@ def _pace_tiers_segment(
     # per-beat energy: cyan height + one-way, variance-gated loudness booster
     height_n = _pace_robust_norm(height_raw)
     loud_n = _pace_robust_norm(loud_beat)
-    iqr_db = float(np.percentile(loud_beat, 75) - np.percentile(loud_beat, 25))
-    w_loud = float(np.clip((iqr_db - 3.0) / 6.0, 0.0, 1.0))
+    w_loud = _pace_dynamics_weight(loud_beat)
     energy = (height_n + w_loud * loud_n) / (1.0 + w_loud)
-    combined = energy + depth_boost * _pace_robust_norm(moddepth)
+    # The depth boost is a CRUTCH for tracks with no dynamics to read, so gate it
+    # by the same spread that gates loudness: where loudness is trustworthy
+    # (w_loud -> 1) the crutch drops out. Ungated it mislabels sparse acoustic
+    # music, because there the modulation is silence between notes, not a burst
+    # train -- on "To Build a Home" it put "intense" on the two QUIETEST
+    # non-ambient sections (-21 and -16 dB) while the -11 dB climax read "normal",
+    # and measured correlation between moddepth and loudness there is +0.05.
+    # Compressed tracks keep it: Push Upstairs is uniformly -10..-11 dB (IQR
+    # 4.7 dB), so texture is the only signal and its tier map is unchanged.
+    combined = energy + _pace_depth_boost(loud_beat, depth_boost) * _pace_robust_norm(moddepth)
 
     # segment boundaries: Foote novelty on TEXTURE-WINDOWED stacked features
     if n < 2 * kernel_beats:
