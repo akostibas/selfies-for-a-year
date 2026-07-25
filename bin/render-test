@@ -83,9 +83,18 @@ if [[ ! -e models ]]; then
   fi
 fi
 
+# SELFIES_BASE is a per-YEAR archive whose folders hold everything from that
+# year -- scanned documents, cards, receipts -- with the selfies in a "<year>
+# selfies" subfolder. Globbing the year folders themselves feeds scanned
+# paperwork to the face pipeline (it shipped a greetings card into a render on
+# 2026-07-24), so match the selfie subfolders only.
 dirs=()
 if ((all_years)); then
-  for d in "$SELFIES_BASE"/*/; do dirs+=("$d"); done
+  for d in "$SELFIES_BASE"/*/*selfies*/; do [[ -d "$d" ]] && dirs+=("$d"); done
+  if ((${#dirs[@]} == 0)); then
+    echo "error: no '<year> selfies' folders under $SELFIES_BASE" >&2
+    exit 1
+  fi
 else
   dirs=("$SELFIES_2026")
 fi
