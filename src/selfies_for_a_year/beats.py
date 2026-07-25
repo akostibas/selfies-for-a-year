@@ -556,47 +556,28 @@ def _spectral_occupancy(y: np.ndarray, sr: int, hop: int = 512) -> float:
     return float((Sw > (p95 - 30.0)).mean())
 
 
-def _even_felt_gap(raw_felt_gap: float) -> int:
-    """Nearest EVEN felt-beat gap, breaking ties toward the FASTER rung.
+def _felt_tier_gaps() -> dict[str, int]:
+    """The pace ladder, as a whole number of FELT beats per photo.
 
-    Only even gaps keep the cut on a stable bar position (see
-    _felt_locked_cut_indices), so a song whose target rate lands halfway between
-    two rungs has to be rounded to one of them. Round toward the faster one: the
-    owner has now twice called the slow side boring ("the long spacing gets
-    boring visually", 2026-07-25), and a slightly quick cut still lands on the
-    music where a slow one reads as a stall. Concretely on "To Build a Home":
-    the occupancy ladder asks for a photo every 6 beats (3 felt), which used to
-    round UP to 4 felt = every 8 beats — the exact rate the owner had already
-    rejected as too slow. It now rounds down to 2 felt = every 4."""
-    return max(2, int(np.ceil(raw_felt_gap / 2.0 - 0.5)) * 2)
+    A fixed metronomic subdivision that halves at each rung — the owner's model
+    (2026-07-25): "Intense is 1:1 (photo:beat), Normal could be 1:2 and Slow 1:4."
+    A felt beat is two raw detected beats, so on the raw grid this reads as
+    intense every beat, normal every 2nd, slow every 4th:
 
+      * intense -> every raw beat (1:1). NOT read from here; _felt_locked_cut_
+        indices special-cases it, and it is the one tier that lands on both beat
+        parities. The dict has no intense entry for that reason.
+      * normal  -> 1 felt beat  (1:2 raw)
+      * slow    -> 2 felt beats (1:4 raw)
+      * ambient -> only used for the rare ambient beat that falls on the grid;
+        in its own (sparse/rubato) spans ambient stays strike-driven, untouched.
 
-def _felt_tier_gaps(
-    sub: float, slow_mult: float, bar_felt_beats: int = 4
-) -> dict[str, int]:
-    """The pace ladder, stated ONCE, as a whole number of felt beats per photo.
-
-    Every regime reads its rate from here — the beat grid (_felt_locked_cut_
-    indices) and the onset-anchored spans (_onset_anchor_cuts) alike. They used
-    to state it separately, and on "To Build a Home" `normal` came out 13x
-    apart between them (7.8 beats/photo on the grid, 0.6 anchored): the same
-    tier felt dead in one section and frantic in the next. See issue #46."""
-    bar = max(1, int(bar_felt_beats))
-
-    def _raw_felt_gap(mult: float) -> float:
-        if sub <= 0 or mult <= 0:
-            return 1.0
-        return 1.0 / (2.0 * sub * mult)
-
-    g_intense = 1
-    g_normal = _even_felt_gap(_raw_felt_gap(1.0))
-    g_slow = max(bar, int(round(_raw_felt_gap(slow_mult) / bar)) * bar)
-    # Guarantee the density ordering intense < normal < slow survives rounding
-    # (a coarse bar-snap can collapse slow onto normal on some grids).
-    if g_slow <= g_normal:
-        g_slow = ((g_normal // bar) + 1) * bar
-    return {"intense": g_intense, "normal": g_normal, "slow": g_slow,
-            "ambient": g_slow}
+    This replaced an adaptive ladder (spectral occupancy + even-gap rounding +
+    bar-multiple snapping, issue #46). The owner wanted a pulse they could feel
+    matched across tiers ("Normal and Slow don't seem to be metronome matched
+    like Intense is"), not a per-song-tuned rate, so the --intense/--slow-
+    multiplier knobs no longer affect the grid rate."""
+    return {"normal": 1, "slow": 2, "ambient": 2}
 
 
 def _felt_locked_cut_indices(
@@ -604,37 +585,23 @@ def _felt_locked_cut_indices(
     intense_mask: np.ndarray,
     slow_mask: np.ndarray,
     ambient_mask: np.ndarray,
-    sub: float,
-    intense_mult: float,
-    slow_mult: float,
     parity: int,
-    bar_felt_beats: int = 4,
 ) -> list[int]:
-    """Beat indices to cut on, felt-locked with a SALIENCE-QUANTIZED constant
-    felt-beat gap per tier. Cuts only land on the felt-downbeat parity
-    (`parity`), and within any tier the gap is a fixed whole number of felt
-    beats — but the gap is now snapped so it can't rotate the cut through the
-    weak beats of the bar (the owner's "1,2,1,2" complaint):
+    """Beat indices to cut on, felt-locked to a fixed metronomic subdivision per
+    tier (see _felt_tier_gaps). A "felt beat" is a beat on the felt-downbeat
+    parity (`parity`); a raw detected beat is half of one.
 
-      * intense -> every DETECTED beat (parity AND off-parity). The peak tier's
-        job is drive: at a genuine climax the dense off-parity landings read as
-        momentum, not as the weak-beat rotation the felt-parity lock guards
-        against elsewhere (owner's call, 2026-07-25 — "we could even go a bit
-        faster in intense"). This is double the every-felt-beat rate the tier ran
-        before, and it holds for every track, not just four-on-floor ones.
-      * normal  -> nearest EVEN felt-beat gap (>=2); an even gap has gcd>=2 with
-        the 4-beat bar, so cuts stay on the {beat 1, beat 3} strong/medium
-        subgroup instead of walking onto 2 & 4.
-      * slow / ambient -> nearest BAR-MULTIPLE gap (>= one bar); a bar-multiple
-        gap lands on the SAME bar position every cut (the downbeat, once
-        bar_phase anchors it), giving one clean cut per N bars.
+      * intense -> every DETECTED beat (parity AND off-parity), so 1:1 on the raw
+        grid. The peak tier's job is drive: at a climax the dense off-parity
+        landings read as momentum, not as weak-beat wander (owner, 2026-07-25).
+      * normal  -> every felt beat (gap 1), i.e. 1:2 on the raw grid.
+      * slow / ambient -> every 2nd felt beat (gap 2), i.e. 1:4 on the raw grid.
 
-    The arithmetic (waveform-eng): with constant gap g and bar length b, cut
-    landings cycle through the subgroup generated by g mod b. gcd(g,b)=1 (an odd
-    gap on a 4-bar) rotates through EVERY position incl. the weak 2 & 4; even and
-    bar-multiple gaps keep gcd>1, so the cut position is stable. Pure and
-    deterministic; exercised by tests/test_felt_lock.py."""
-    gaps = _felt_tier_gaps(sub, slow_mult, bar_felt_beats)
+    Every gap here is even in RAW-beat terms (intense=1 raw is the sole exception,
+    and it deliberately covers both parities), so a non-intense cut never wanders
+    onto the off-parity beat. Pure and deterministic; exercised by
+    tests/test_felt_lock.py."""
+    gaps = _felt_tier_gaps()
     g_normal, g_slow = gaps["normal"], gaps["slow"]
 
     felt_idx = -1
@@ -691,15 +658,13 @@ def _drop_opening_flash(
 # cut on the real onset strikes instead. Regime is decided per region by GRID
 # SUPPORT (fraction of felt beats with a prominent strike within 70ms); a span
 # scoring below _ONSET_ANCHOR_THRESH for at least _ONSET_ANCHOR_MIN_SPAN seconds
-# switches to onset-anchoring. The PACE does not change with the regime — it is
-# the same felt-beat gap per tier that the grid uses (_felt_tier_gaps) — only
-# where the cuts LAND does: each scheduled tick is pulled onto a real strike if
-# one is within _SNAP_TOLERANCE_S. Where the pianist played near the tick you cut
-# on the note; where they didn't you cut on the beat, and nothing floats between
-# the two. The lingering tiers (slow, ambient) stay purely strike-driven — one
-# photo every Nth note, see _STRIKE_STRIDE — because that cut-on-a-chord-and-hold
-# character is the part that reviewed best.
-# (Design: audio-engineer consult, agent-chat 'audio' Part 5; issue #46.)
+# switches to onset-anchoring. Inside such a span, only AMBIENT stretches follow
+# the notes (see _NOTE_DRIVEN_TIERS) — that cut-on-a-chord-and-hold character is
+# the part the owner rated 5/5. Intense, normal and slow keep the felt-grid pulse
+# even here: the owner wants them "metronome matched like Intense is"
+# (2026-07-25), so the metronomic grid cuts are retained through the span rather
+# than replaced by note-following ones.
+# (Design: audio-engineer consult, agent-chat 'audio' Part 5; issues #46, #48.)
 # --------------------------------------------------------------------------- #
 
 _GRID_SUPPORT_WINDOW_S = 0.070   # a felt beat "supports" the grid if a strike is this close
@@ -712,27 +677,21 @@ _ONSET_ANCHOR_MIN_SPAN = 8.0     # min span seconds, so the regime can't flap
 _ONSET_ANCHOR_SONG_GATE = 0.65
 _STRIKE_COALESCE_S = 0.40        # merge strikes closer than this (keep the louder)
 
-# How close a scheduled tick has to be to a real note for the cut to move onto
-# the note. Roughly a 16th at 120 BPM: beyond it the "cut" and the "note" are
-# two separate events to the ear, and pulling that far would distort the pace we
-# just committed to. Audio-visual tolerance is asymmetric (picture leading sound
-# is objectionable from ~15ms, lagging fine to ~45ms), but the snap is symmetric
-# because a strike within tolerance IS the event — we land on it, not near it.
-_SNAP_TOLERANCE_S = 0.120
 # A photo held under this reads as a flash, not an image you saw. We shipped a
 # 50ms frame as a bug once; per the project's guiding star, a cut that can't
 # clear the floor is DROPPED (the previous photo lingers) rather than spent on a
 # frame nobody registers.
 _MIN_HOLD_S = 0.100
-# Tiers scheduled directly off the note strikes rather than the felt grid, as
-# {tier: notes-per-photo}:
-#   * slow / ambient (stride 4 / 2) LINGER — 92-100% of their cuts land on an
-#     attack and the owner rated those sections 5/5, so re-pacing left them alone.
-#   * intense (stride 1) DRIVES — inside an anchor span the beat grid is fiction
-#     (that is what makes it a span), so "every raw beat" has no meaning there;
-#     the faithful translation of the owner's every-beat intense is one cut per
-#     prominent note, the densest the rubato actually offers.
-_STRIKE_STRIDE = {"slow": 4, "ambient": 2, "intense": 1}
+# Tiers that follow the note strikes instead of the felt grid, as
+# {tier: notes-per-photo}. slow/ambient LINGER — one photo every Nth prominent
+# note, the cut-on-a-chord-and-hold character the owner rated 5/5. Used for
+# ambient inside its spans (see _NOTE_DRIVEN_TIERS) and, when a song has no felt
+# grid at all, as the fallback pace for every tier.
+_STRIKE_STRIDE = {"slow": 4, "ambient": 2}
+# Tiers that stay strike-driven even when a felt grid IS available. Only ambient:
+# the owner wants intense/normal/slow metronome-locked to the grid everywhere,
+# but the sparse ambient passages read best following the actual notes.
+_NOTE_DRIVEN_TIERS = frozenset({"ambient"})
 
 
 def _prominent_strikes(
@@ -892,64 +851,32 @@ def _strike_stride_cuts(
     return [(s, tier) for s in inside[::stride]]
 
 
-def _snapped_cuts(
-    stretch: tuple[float, float], sel: list[float], tier: str,
-    felt_beats: np.ndarray, felt_gaps: dict[str, int],
-) -> list[tuple[float, str]]:
-    """The tier's own felt-beat rate, with each tick pulled onto a real note if
-    one is within _SNAP_TOLERANCE_S.
-
-    This is the way out of the bind the owner named: "the long spacing gets
-    boring visually, but random photo flipping doesn't seem to solve the
-    problem". Counting notes made the pace track how often the pianist happened
-    to play; scheduling on the grid alone put cuts on nothing. Scheduling on the
-    grid and landing on the notes that are there does both."""
-    a, b = stretch
-    gap = max(1, int(felt_gaps.get(tier, 2)))
-    fb = felt_beats[(felt_beats >= a - _SNAP_TOLERANCE_S) & (felt_beats < b)]
-    out: list[tuple[float, str]] = []
-    used: set[float] = set()
-    for i in range(0, len(fb), gap):
-        tick = float(fb[i])
-        cand = [s for s in sel
-                if abs(s - tick) <= _SNAP_TOLERANCE_S and s not in used
-                and a - 1e-9 <= s < b]
-        t = min(cand, key=lambda s: abs(s - tick)) if cand else tick
-        if t < a - 1e-9 or t >= b:
-            continue
-        used.add(t)
-        out.append((t, tier))
-    return out
-
-
 def _onset_anchor_cuts(
     span: tuple[float, float], strikes: np.ndarray,
-    tier_at: callable, ambient_default: str = "slow", *,
-    felt_beats: np.ndarray | None = None,
-    felt_gaps: dict[str, int] | None = None,
+    tier_at: callable, ambient_default: str = "ambient", *,
+    has_grid: bool = False,
 ) -> list[tuple[float, str]]:
-    """Cut times inside an onset-anchor span, at the tier's normal pace.
+    """Strike-driven cut times inside an onset-anchor span.
 
-    Normal rides the felt-beat grid and snaps onto real notes; the strike-driven
-    tiers count notes instead — slow/ambient linger, intense takes every note
-    (see _snapped_cuts / _strike_stride_cuts / _STRIKE_STRIDE). Without a felt
-    grid to schedule against, everything falls back to counting notes.
-    Pure; exercised by tests/test_onset_anchor.py."""
+    Only the note-driven stretches produce cuts here: ambient (see
+    _NOTE_DRIVEN_TIERS), and — when the song has no felt grid at all — every
+    tier, since there is then no metronomic pulse to fall back on. Intense,
+    normal and slow keep their felt-grid cuts through the span; the splice retains
+    those rather than replacing them, so they stay metronome-locked. Pure;
+    exercised by tests/test_onset_anchor.py."""
     t0, t1 = span
     sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
     if not sel:
         return []
-    has_grid = felt_beats is not None and felt_gaps is not None and len(felt_beats)
     out: list[tuple[float, str]] = []
     for stretch, tier in _tier_stretches(span, sel, tier_at, ambient_default):
-        if tier in _STRIKE_STRIDE or not has_grid:
+        if tier in _NOTE_DRIVEN_TIERS or not has_grid:
             out.extend(_strike_stride_cuts(stretch, sel, tier))
-        else:
-            out.extend(_snapped_cuts(stretch, sel, tier, felt_beats, felt_gaps))
-    # Snapping and the stretch hand-offs can put two cuts within a frame of each
-    # other; a hold nobody registers is a wasted photo, so drop the later one.
-    # The span edge counts too: grid cutting resumes at t1, so a cut just inside
-    # it would flash. Drop it and let the last photo run into the boundary.
+        # else: the metronomic grid cuts are kept by the splice; emit nothing.
+    # The stretch hand-offs can put two cuts within a frame of each other; a hold
+    # nobody registers is a wasted photo, so drop the later one. The span edge
+    # counts too: grid cutting resumes at t1, so a cut just inside it would flash.
+    # Drop it and let the last photo run into the boundary.
     out = [(t, k) for t, k in out if t <= t1 - _MIN_HOLD_S + 1e-9]
     out.sort(key=lambda tk: tk[0])
     deduped: list[tuple[float, str]] = []
@@ -966,13 +893,15 @@ def _splice_onset_anchor(
     strikes: np.ndarray,
     tier_at: callable,
     heights: np.ndarray | None = None,
-    felt_beats: np.ndarray | None = None,
-    felt_gaps: dict[str, int] | None = None,
+    has_grid: bool = False,
 ) -> list[tuple[float, str]]:
-    """Replace grid transitions inside onset-anchor spans with strike-anchored
-    cuts, leaving grid spans untouched. Strikes are coalesced PER SPAN (a fast
-    chord/grace pair collapses to its louder hit) before the pace mapping. Pure;
-    exercised by tests."""
+    """Inside onset-anchor spans, replace the grid transitions of the NOTE-DRIVEN
+    tiers with strike-anchored cuts, but KEEP the grid transitions of the
+    metronome-locked tiers (intense/normal/slow) so their pulse rides through the
+    span. When the song has no felt grid at all (`has_grid` False), every tier is
+    note-driven and all in-span grid transitions are replaced. Strikes are
+    coalesced PER SPAN (a fast chord/grace pair collapses to its louder hit)
+    before the pace mapping. Pure; exercised by tests."""
     if not spans:
         return transitions
     strikes = np.asarray(strikes, dtype=float)
@@ -981,14 +910,18 @@ def _splice_onset_anchor(
     def _in_span(t: float) -> bool:
         return any(t0 <= t < t1 for t0, t1 in spans)
 
-    kept = [(t, k) for (t, k) in transitions if not _in_span(t)]
+    def _replaced(t: float, kind: str) -> bool:
+        # A grid cut is dropped only where a strike-driven cut will take its place:
+        # note-driven tiers, or everything when there is no grid to hold onto.
+        return _in_span(t) and (not has_grid or kind in _NOTE_DRIVEN_TIERS)
+
+    kept = [(t, k) for (t, k) in transitions if not _replaced(t, k)]
     for span in spans:
         t0, t1 = span
         m = (strikes >= t0 - 1e-6) & (strikes < t1 + 1e-6)
         span_strikes = _coalesce_strikes(strikes[m], heights[m])
         kept.extend(_onset_anchor_cuts(
-            span, span_strikes, tier_at,
-            felt_beats=felt_beats, felt_gaps=felt_gaps,
+            span, span_strikes, tier_at, has_grid=has_grid,
         ))
     kept.sort(key=lambda tk: tk[0])
     return kept
@@ -2002,13 +1935,11 @@ def build_timeline(
         n = len(beat_times)
 
         if cut_felt_parity is not None:
-            # Occupancy felt-lock: cuts on the felt-downbeat parity at a CONSTANT
-            # integer felt-beat gap per tier (no 1/2-beat alternation). Uses the
-            # RAW tier multipliers so contrast stays wide. See _felt_locked_cut_
-            # indices + tests/test_felt_lock.py.
+            # Felt-lock: cuts on the felt-downbeat parity at a fixed metronomic
+            # subdivision per tier (intense 1:1, normal 1:2, slow 1:4 on the raw
+            # grid). See _felt_locked_cut_indices + tests/test_felt_lock.py.
             for k in _felt_locked_cut_indices(
-                n, intense_mask, slow_mask, beat_is_ambient, sub,
-                intense_multiplier, slow_multiplier, cut_felt_parity,
+                n, intense_mask, slow_mask, beat_is_ambient, cut_felt_parity,
             ):
                 t = float(beat_times[k])
                 out.append((t, _kind_at(t)))
@@ -2174,19 +2105,14 @@ def build_timeline(
                     return "ambient"
             return "normal"
 
-        # Anchored spans re-pace at the SAME felt-beat gaps the grid uses, so a
-        # tier sounds like itself in both regimes (issue #46). Without the felt
-        # lock there is no felt grid to schedule against, and the anchored spans
-        # fall back to counting notes.
-        anchor_gaps = (
-            _felt_tier_gaps(subdivision, slow_multiplier)
-            if cut_felt_parity is not None else None
-        )
+        # With a felt grid, intense/normal/slow keep their metronomic grid cuts
+        # through the span and only ambient follows the notes (issue #48). Without
+        # the felt lock there is no grid to hold onto, so every tier note-counts.
+        has_felt_grid = cut_felt_parity is not None
         transitions = _splice_onset_anchor(
             transitions, anchor_spans, onset_strikes, _tier_at_time,
             onset_strike_heights,
-            felt_beats=felt_for_support if anchor_gaps else None,
-            felt_gaps=anchor_gaps,
+            has_grid=has_felt_grid,
         )
         onset_anchor_spans_final = anchor_spans
         # The splice may have removed the t=0 start (it sits inside the intro

@@ -1,16 +1,16 @@
 """Onset-anchored cutting for rubato/sparse sections.
 
-Where the beat grid is fiction, cuts follow real note strikes. These cover the
-pure scheduling pieces (no audio): grid-support scoring, span detection, the
-snapped/strike-driven schedulers, and splicing strike cuts over grid cuts.
+Where the beat grid is fiction, AMBIENT cuts follow real note strikes while the
+metronome tiers (intense/normal/slow) keep their grid pulse (issue #48). These
+cover the pure scheduling pieces (no audio): grid-support scoring, span
+detection, the strike-driven scheduler, and splicing over grid cuts.
 """
 import numpy as np
 
 from selfies_for_a_year.beats import (
     _MIN_HOLD_S,
-    _SNAP_TOLERANCE_S,
+    _NOTE_DRIVEN_TIERS,
     _STRIKE_STRIDE,
-    _even_felt_gap,
     _felt_tier_gaps,
     _grid_support,
     _onset_anchor_cuts,
@@ -65,10 +65,6 @@ def test_onset_anchor_spans_never_overlap():
     "To Build a Home" at 3:20).
     """
     beats = np.arange(0, 120.0, 0.42)
-    # Strikes thinned to sit near the support threshold, so window support
-    # wobbles across it the way real sparse passages do — that wobble is what
-    # separates two low runs by one or two windows and makes their padded spans
-    # overlap. Seed 0 produced (26,46) vs (44,52) before the fix.
     rng = np.random.default_rng(0)
     strikes = beats[rng.random(len(beats)) < 0.32] + 0.01
     spans = _onset_anchor_spans(beats, strikes, 120.0)
@@ -77,117 +73,52 @@ def test_onset_anchor_spans_never_overlap():
         assert a1 <= b0, f"overlapping spans {(a0, a1)} and {(b0, b1)}"
 
 
-def test_splice_emits_each_strike_once_across_spans():
-    """Even given adjacent spans, no strike may produce two cuts at the same time."""
-    grid = [(t, "normal") for t in np.arange(0, 30, 1.0)]
-    strikes = np.array([2.5, 7.5, 12.5, 17.5])
-    spans = [(0.0, 10.0), (10.0, 20.0)]
-    out = _splice_onset_anchor(grid, spans, strikes, lambda t: "intense")
-    times = [t for t, _ in out]
-    assert len(times) == len(set(times)), f"duplicate cut times: {times}"
+def test_felt_tier_gaps_is_the_fixed_metronomic_ladder():
+    """A fixed halving ladder in felt beats (issue #48): normal 1, slow 2, no
+    per-song tuning. Intense is every raw beat and is not read from here."""
+    g = _felt_tier_gaps()
+    assert g == {"normal": 1, "slow": 2, "ambient": 2}
+    assert g["normal"] < g["slow"]
 
 
-def test_even_felt_gap_breaks_ties_toward_the_faster_rung():
-    """The bug behind "the long spacing gets boring" (#46).
-
-    "To Build a Home" asks for a photo every 6 beats = 3 felt, exactly between
-    the two legal rungs. Rounding up delivered every 8 — a rate the owner had
-    already rejected as too slow — so ties now round down.
-    """
-    assert _even_felt_gap(3.0) == 2
-    assert _even_felt_gap(5.0) == 4
-    # ...without disturbing the unambiguous cases.
-    assert _even_felt_gap(3.9) == 4
-    assert _even_felt_gap(2.9) == 2
-    assert _even_felt_gap(6.0) == 6
-    assert _even_felt_gap(0.1) == 2  # never faster than every other felt beat
-
-
-def test_felt_tier_gaps_keep_the_density_ordering():
-    """intense < normal < slow must survive the even/bar snapping on any grid."""
-    for sub in (1 / 16, 1 / 8, 1 / 6, 1 / 4, 1 / 2, 1.0):
-        for slow_mult in (0.2, 0.33, 0.5, 1.0):
-            g = _felt_tier_gaps(sub, slow_mult)
-            assert g["intense"] < g["normal"] < g["slow"], (sub, slow_mult, g)
-            assert g["ambient"] == g["slow"]
-            assert g["normal"] % 2 == 0
-
-
-def test_anchored_pace_is_the_tier_pace_not_the_note_count():
-    """One rate per tier, both regimes (#46): `normal` cuts every g_normal felt
-    beats inside an anchor span too, however many notes the pianist played."""
-    felt = np.arange(0.0, 30.0, 0.5)
-    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
-    sparse = np.array([0.0, 4.3, 11.7, 22.1])
-    dense = np.arange(0.0, 30.0, 0.31)
-    for strikes in (sparse, dense):
-        cuts = _onset_anchor_cuts(
-            (0.0, 30.0), strikes, lambda t: "normal",
-            felt_beats=felt, felt_gaps=gaps,
-        )
-        ts = np.array([t for t, _ in cuts])
-        # every 2 felt beats = 1.0s, give or take the snap
-        assert abs(np.median(np.diff(ts)) - 1.0) <= _SNAP_TOLERANCE_S, ts
-
-
-def test_ticks_land_on_real_notes_when_there_is_one_nearby():
-    """The whole point of snapping: play near the tick and the cut is the note."""
-    felt = np.arange(0.0, 20.0, 0.5)
-    gaps = {"normal": 2}
-    # A strike just inside tolerance of every scheduled tick (every 1.0s).
-    strikes = np.arange(0.0, 20.0, 1.0) + 0.08
-    cuts = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "normal",
-        felt_beats=felt, felt_gaps=gaps,
-    )
-    ts = [t for t, _ in cuts]
-    assert all(any(abs(t - s) < 1e-9 for s in strikes) for t in ts), ts
-
-
-def test_ticks_out_of_reach_of_a_note_stay_on_the_beat():
-    """Beyond tolerance the note is a separate event — don't drag the pace to it."""
-    felt = np.arange(0.0, 20.0, 0.5)
-    gaps = {"normal": 2}
-    strikes = np.arange(0.0, 20.0, 1.0) + 0.30  # 300ms out, way past tolerance
-    cuts = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "normal",
-        felt_beats=felt, felt_gaps=gaps,
-    )
-    ts = [t for t, _ in cuts]
-    assert all(any(abs(t - f) < 1e-9 for f in felt) for t in ts), ts
-
-
-def test_lingering_tiers_stay_strike_driven():
-    """ambient and slow reviewed at 5/5 with every cut on an attack; the
-    re-pacing must not put them on the grid, even when a grid is available."""
-    felt = np.arange(0.0, 20.0, 0.5)
-    gaps = {"slow": 4, "ambient": 4, "normal": 2}
-    strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
-    for tier in ("ambient", "slow"):
-        cuts = _onset_anchor_cuts(
-            (0.0, 20.0), strikes, lambda t, _t=tier: _t,
-            felt_beats=felt, felt_gaps=gaps,
-        )
-        ts = [t for t, _ in cuts]
-        assert ts == list(strikes[:: _STRIKE_STRIDE[tier]]), (tier, ts)
-
-
-def test_anchored_intense_takes_every_note():
-    """Inside an anchor span the beat grid is fiction, so "every raw beat" has no
-    meaning; the faithful translation of every-beat intense is one cut per note.
-    Unlike the felt-locked tiers, intense does NOT ride the grid here."""
-    felt = np.arange(0.0, 20.0, 0.5)
-    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
+def test_ambient_stays_strike_driven_even_with_a_grid():
+    """Ambient reviewed at 5/5 following the actual notes; a grid being available
+    must not pull it onto the metronome."""
     strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
     cuts = _onset_anchor_cuts(
-        (0.0, 20.0), strikes, lambda t: "intense",
-        felt_beats=felt, felt_gaps=gaps,
+        (0.0, 20.0), strikes, lambda t: "ambient", has_grid=True,
     )
     ts = [t for t, _ in cuts]
-    assert ts == list(strikes[:: _STRIKE_STRIDE["intense"]]), ts
+    assert ts == list(strikes[:: _STRIKE_STRIDE["ambient"]]), ts
+    assert _NOTE_DRIVEN_TIERS == frozenset({"ambient"})
 
 
-def test_lingering_tiers_linger_across_gaps():
+def test_metronome_tiers_emit_no_anchor_cuts_when_a_grid_exists():
+    """intense/normal/slow keep their felt-grid pulse through a span, so the
+    anchor scheduler emits nothing for them — the splice retains the grid cuts."""
+    strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    for tier in ("intense", "normal", "slow"):
+        cuts = _onset_anchor_cuts(
+            (0.0, 20.0), strikes, lambda t, _t=tier: _t, has_grid=True,
+        )
+        assert cuts == [], (tier, cuts)
+
+
+def test_without_a_grid_every_tier_note_counts():
+    """A song with no felt grid at all has no metronome to fall back on, so every
+    tier follows the notes at its stride (slow lingers, normal takes each note)."""
+    strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    slow = _onset_anchor_cuts(
+        (0.0, 20.0), strikes, lambda t: "slow", has_grid=False,
+    )
+    assert [t for t, _ in slow] == list(strikes[:: _STRIKE_STRIDE["slow"]])
+    normal = _onset_anchor_cuts(
+        (0.0, 20.0), strikes, lambda t: "normal", has_grid=False,
+    )
+    assert [t for t, _ in normal] == list(strikes)  # stride 1 default
+
+
+def test_ambient_lingers_across_gaps():
     """A silent gap produces NO cut — we never invent a beat between notes."""
     strikes = np.array([0.0, 1.0, 2.0, 8.0, 9.0])  # 2s..8s is a 6s gap
     cuts = _onset_anchor_cuts((0.0, 10.0), strikes, lambda t: "ambient")
@@ -197,31 +128,68 @@ def test_lingering_tiers_linger_across_gaps():
 
 def test_no_cut_lands_under_the_legibility_floor():
     """A hold too brief to register is a wasted selfie -- drop it, don't show it.
-
-    A tier change mid-span hands off between two schedulers, which is where a
-    pair of near-coincident cuts would otherwise sneak in.
-    """
-    felt = np.arange(0.0, 8.0, 0.21)
-    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
-    strikes = np.array([0.0, 0.42, 0.83, 1.25, 1.30, 5.0, 5.05, 5.3])
+    Near-coincident strikes must not produce a sub-floor flash."""
+    strikes = np.array([0.0, 0.05, 1.0, 1.03, 5.0, 5.3])  # some pairs within a frame
     cuts = _onset_anchor_cuts(
-        (0.0, 8.0), strikes, lambda t: "intense" if t < 1.3 else "normal",
-        felt_beats=felt, felt_gaps=gaps,
+        (0.0, 8.0), strikes, lambda t: "ambient", has_grid=False,
     )
     ts = np.array([t for t, _ in cuts])
     holds = np.diff(np.append(ts, 8.0))
     assert holds.min() >= _MIN_HOLD_S - 1e-9, sorted(holds)[:5]
 
 
-def test_splice_replaces_only_inside_spans():
+def test_splice_retains_metronome_grid_cuts_in_spans():
+    """The core of issue #48: a normal-tier grid cut inside an anchor span STAYS
+    (metronome-locked), rather than being replaced by note-following cuts."""
+    grid = [(t, "normal") for t in np.arange(0, 20, 1.0)]
+    strikes = np.array([0.5, 3.7, 5.5])
+    spans = [(0.0, 8.0)]
+    out = _splice_onset_anchor(
+        grid, spans, strikes, lambda t: "normal", has_grid=True,
+    )
+    times = [t for t, _ in out]
+    # every original grid cut survives; no strike-driven cut was inserted
+    assert times == [float(t) for t in np.arange(0, 20, 1.0)], times
+
+
+def test_splice_replaces_ambient_grid_cuts_in_spans():
+    """An ambient stretch inside a span DOES get note-following cuts, and its
+    grid cuts are dropped — the metronome tiers around it are unaffected."""
+    grid = [(t, "ambient") for t in np.arange(0, 20, 1.0)]
+    strikes = np.array([0.5, 2.5, 5.5, 7.0])  # 4 in-span notes; ambient stride 2
+    spans = [(0.0, 8.0)]
+    out = _splice_onset_anchor(
+        grid, spans, strikes, lambda t: "ambient", has_grid=True,
+    )
+    times = [t for t, _ in out]
+    inside = [t for t in times if 0 <= t < 8]
+    assert not any(abs(t - round(t)) < 1e-9 for t in inside), inside  # grid gone
+    assert inside == [0.5, 5.5], inside                               # every 2nd note
+    assert 10.0 in times and 15.0 in times                           # outside kept
+
+
+def test_splice_without_grid_replaces_all_in_span():
+    """No felt grid -> every in-span grid cut is replaced by note-driven cuts."""
     grid = [(t, "normal") for t in np.arange(0, 20, 1.0)]
     strikes = np.array([0.5, 5.5, 10.5])
     spans = [(0.0, 8.0)]
-    out = _splice_onset_anchor(grid, spans, strikes, lambda t: "intense")
-    # grid cuts in [0,8) gone; the strikes there anchor bursts; grid cuts >=8 kept
+    out = _splice_onset_anchor(
+        grid, spans, strikes, lambda t: "normal", has_grid=False,
+    )
     times = [t for t, _ in out]
-    assert 0.5 in times and 5.5 in times
     inside = [t for t in times if 0 <= t < 8]
-    assert not any(abs(t - round(t)) < 1e-9 for t in inside), inside  # no grid cut left
-    assert all(0.5 <= t < 0.5 + 2 or 5.5 <= t < 5.5 + 2 for t in inside), inside
+    assert not any(abs(t - round(t)) < 1e-9 for t in inside), inside
+    assert 0.5 in times and 5.5 in times
     assert 10.0 in times and 15.0 in times  # untouched grid outside the span
+
+
+def test_splice_emits_each_strike_once_across_spans():
+    """Even given adjacent spans, no strike may produce two cuts at the same time."""
+    grid = [(t, "ambient") for t in np.arange(0, 30, 1.0)]
+    strikes = np.array([2.5, 7.5, 12.5, 17.5])
+    spans = [(0.0, 10.0), (10.0, 20.0)]
+    out = _splice_onset_anchor(
+        grid, spans, strikes, lambda t: "ambient", has_grid=False,
+    )
+    times = [t for t, _ in out]
+    assert len(times) == len(set(times)), f"duplicate cut times: {times}"

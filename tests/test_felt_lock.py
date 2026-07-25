@@ -35,11 +35,10 @@ def _felt_index(k, parity):
 
 
 @pytest.mark.parametrize("parity", [0, 1])
-@pytest.mark.parametrize("sub", [1 / 6, 1 / 8, 1 / 4])
-def test_all_cuts_on_felt_parity(parity, sub):
+def test_all_cuts_on_felt_parity(parity):
     n = 240
     intense, slow, ambient = _masks(n, [(60, 120, "intense"), (160, 240, "slow")])
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, parity)
     assert idxs, "expected some cuts"
     # Intense cuts on every detected beat (both parities) by design; every other
     # tier must still land only on the felt parity, even across the boundaries.
@@ -52,8 +51,7 @@ def test_constant_gap_within_each_tier(parity):
     n = 300
     # normal 0-90, intense 90-180, slow 180-300
     intense, slow, ambient = _masks(n, [(90, 180, "intense"), (180, 300, "slow")])
-    sub = 1 / 6
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, parity)
 
     def tier_of(k):
         if intense[k]:
@@ -88,8 +86,7 @@ def test_denser_tier_has_smaller_gap():
     """intense should cut more often than normal, which cuts more often than slow."""
     n = 300
     intense, slow, ambient = _masks(n, [(90, 180, "intense"), (180, 300, "slow")])
-    sub = 1 / 6
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, 0)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 0)
 
     # Measure in RAW detected beats: intense cuts every beat, so its felt-index
     # gap would alternate 0,1 and mislead. In raw terms intense=1 < normal < slow.
@@ -110,7 +107,7 @@ def test_no_cuts_when_all_off_parity_region_is_short():
     intense = np.zeros(n, bool)
     slow = np.zeros(n, bool)
     ambient = np.zeros(n, bool)
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, 0)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 0)
     assert idxs[0] == 0
 
 
@@ -125,29 +122,24 @@ def _tier_gap(idxs, parity, lo, hi):
 
 
 @pytest.mark.parametrize("parity", [0, 1])
-@pytest.mark.parametrize("sub", [1 / 4, 1 / 6, 1 / 8])
-def test_normal_gap_is_even(parity, sub):
-    """The normal-tier felt-beat gap must be even, so cuts stay on the {1,3}
-    strong/medium subgroup of a 4-beat bar instead of walking onto 2 & 4."""
+def test_normal_cuts_every_felt_beat(parity):
+    """Normal is a fixed 1 felt beat per photo (1:2 on the raw grid)."""
     n = 400
     intense, slow, ambient = _masks(n, [])  # all normal
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, sub, 3.0, 0.33, parity)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, parity)
     g = _tier_gap(idxs, parity, 0, n)
-    assert g is not None and g % 2 == 0, f"normal gap {g} must be even"
+    assert g == 1, f"normal gap {g} must be 1 felt beat"
 
 
 @pytest.mark.parametrize("parity", [0, 1])
-@pytest.mark.parametrize("bar", [3, 4])
-def test_slow_gap_is_bar_multiple(parity, bar):
-    """The slow-tier felt-beat gap must be a whole number of bars, so every cut
-    lands on the same bar position (one clean cut per N bars)."""
+def test_slow_cuts_every_second_felt_beat(parity):
+    """Slow is a fixed 2 felt beats per photo (1:4 on the raw grid), landing on
+    the same {1,3} strong subgroup of the bar every time."""
     n = 500
     intense, slow, ambient = _masks(n, [(0, n, "slow")])
-    idxs = _felt_locked_cut_indices(
-        n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity, bar_felt_beats=bar
-    )
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, parity)
     g = _tier_gap(idxs, parity, 0, n)
-    assert g is not None and g % bar == 0, f"slow gap {g} must be a multiple of the bar {bar}"
+    assert g == 2, f"slow gap {g} must be 2 felt beats"
 
 
 @pytest.mark.parametrize("parity", [0, 1])
@@ -157,7 +149,7 @@ def test_intense_cuts_on_every_detected_beat(parity):
     kick-detection gate that limited it to four-on-floor tracks is gone)."""
     n = 60
     intense, slow, ambient = _masks(n, [(20, 40, "intense")])
-    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, 1 / 6, 3.0, 0.33, parity)
+    idxs = _felt_locked_cut_indices(n, intense, slow, ambient, parity)
     intense_cuts = [k for k in idxs if 20 <= k < 40]
     # consecutive detected-beat indices -> gap of 1 in k, both parities present
     assert intense_cuts == list(range(20, 40)), intense_cuts
