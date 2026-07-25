@@ -172,6 +172,21 @@ def test_lingering_tiers_stay_strike_driven():
         assert ts == list(strikes[:: _STRIKE_STRIDE[tier]]), (tier, ts)
 
 
+def test_anchored_intense_takes_every_note():
+    """Inside an anchor span the beat grid is fiction, so "every raw beat" has no
+    meaning; the faithful translation of every-beat intense is one cut per note.
+    Unlike the felt-locked tiers, intense does NOT ride the grid here."""
+    felt = np.arange(0.0, 20.0, 0.5)
+    gaps = {"intense": 1, "normal": 2, "slow": 4, "ambient": 4}
+    strikes = np.array([0.13, 1.37, 2.61, 4.02, 5.44, 6.71, 8.09, 9.33])
+    cuts = _onset_anchor_cuts(
+        (0.0, 20.0), strikes, lambda t: "intense",
+        felt_beats=felt, felt_gaps=gaps,
+    )
+    ts = [t for t, _ in cuts]
+    assert ts == list(strikes[:: _STRIKE_STRIDE["intense"]]), ts
+
+
 def test_lingering_tiers_linger_across_gaps():
     """A silent gap produces NO cut — we never invent a beat between notes."""
     strikes = np.array([0.0, 1.0, 2.0, 8.0, 9.0])  # 2s..8s is a 6s gap

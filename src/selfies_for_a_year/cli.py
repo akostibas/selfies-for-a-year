@@ -907,7 +907,6 @@ def compile(
     snap_to_grid: Annotated[bool, typer.Option(help="[--vary-pace] Snap --intense/--slow-multiplier to the nearest power-of-2 musical fraction (1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16) so cuts stay on the 4/4 grid. Disable to allow triplets/polyrhythms.")] = True,
     tier_lead_seconds: Annotated[float, typer.Option(help="[--vary-pace] Shift tier-region detection earlier by N seconds for anticipation (intense kicks in just before the audible cue). 0 = no shift. Try 0.3–1.0s for a music-video feel.")] = 0.0,
     onset_anchor: Annotated[str, typer.Option(help="[--beat-sync] Where the beat grid is fiction (sparse/rubato passages), cut on the real note strikes instead: 'auto' (detect those spans by grid support), 'never' (always trust the grid), 'always' (treat the whole song as rubato). Metronome dot moves onto the strikes there.")] = "auto",
-    intense_per_kick: Annotated[str, typer.Option(help="[--beat-sync] In intense sections, cut once per kick (every detected beat) instead of every 2nd: 'auto' (on when the kick is measured on every beat — a driving track), 'on' (force), 'off' (force every-felt-beat). Normal/slow pacing is unaffected.")] = "auto",
     preview_seconds: Annotated[float | None, typer.Option(help="Fast feel-check: render only the first N seconds. Keeps full-song beat/pace analysis but aligns just the photos needed for the clip, so a ~5min render becomes ~15s. For iteration, not final output.")] = None,
     beat_crossfade: Annotated[bool, typer.Option(help="[--beat-sync] Replace hard cuts with continuous crossfade: each photo peaks at its beat and morphs into the next over the segment.")] = False,
     debug: Annotated[bool, typer.Option(help="Overlay ALL review HUDs: pacing tier + song/BPM, source filename, the track-progression bar with playhead, and the metronome dot (flashes on each cut target — strikes in onset-anchor spans). On for iteration/review; leave off for a clean production render. Forces constant-fps rendering.")] = False,
@@ -1009,9 +1008,6 @@ def compile(
 
     if onset_anchor not in ("auto", "never", "always"):
         typer.echo(f"Error: --onset-anchor must be 'auto', 'never', or 'always', got '{onset_anchor}'.", err=True)
-        raise typer.Exit(1)
-    if intense_per_kick not in ("auto", "on", "off"):
-        typer.echo(f"Error: --intense-per-kick must be 'auto', 'on', or 'off', got '{intense_per_kick}'.", err=True)
         raise typer.Exit(1)
 
 
@@ -1246,7 +1242,6 @@ def compile(
             pace_model="segment",
             base_pace="occupancy",
             onset_anchor=onset_anchor,
-            intense_per_kick=intense_per_kick,
         )
         typer.echo(timeline.summary())
 
