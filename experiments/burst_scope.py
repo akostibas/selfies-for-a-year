@@ -114,14 +114,95 @@ def one_per_strike(span, strikes, tier_at, ambient_default="slow"):
     return out
 
 
-MODES = {"fixed": None, "interval": interval_burst, "onstrike": one_per_strike}
+BEAT_TIMES: dict = {}  # filled before the run so snap_to_strike can see the grid
+# Beats per photo by tier. The pace is stated ONCE, as a musical rate, and holds
+# everywhere -- which is the actual bug the other candidates dance around:
+# `normal` currently runs 7.8 beats/photo on the grid and 0.6 beats/photo inside
+# anchor spans, a 13x swing within a single tier.
+BEATS_PER_PHOTO = {"intense": 1.0, "normal": 2.0, "slow": 6.0, "ambient": 8.0}
+SNAP_TOLERANCE_S = 0.12   # a tick this close to a real strike cuts on the strike
+
+
+def snap_to_strike(span, strikes, tier_at, ambient_default="slow"):
+    """Candidate: a constant musical rate, landing on real notes where they exist.
+
+    Schedule cuts at the tier's beat rate, then pull each one onto the nearest
+    strike within SNAP_TOLERANCE_S. Where the pianist played near the tick you
+    cut on the note; where they didn't, you cut on the beat. Nothing is invented
+    between the notes and nothing waits 8 beats for the next one -- which is the
+    bind: long spacing is boring, but photos that aren't on anything don't read
+    as connected.
+
+    ambient and slow stay strike-driven (they are rated 5/5 and their whole
+    character is lingering on a chord), so this only re-paces normal/intense.
+    """
+    t0, t1 = span
+    sel = [float(s) for s in np.asarray(strikes) if t0 - 1e-6 <= s < t1 + 1e-6]
+    if not sel:
+        return []
+    tier = tier_at(sel[0]) or ambient_default
+    if tier in ("ambient", "slow"):
+        return one_per_strike(span, strikes, tier_at, ambient_default)
+
+    beats = BEAT_TIMES.get("t")
+    if beats is None or not len(beats):
+        return one_per_strike(span, strikes, tier_at, ambient_default)
+    out: list[tuple[float, str]] = []
+    used: set[float] = set()
+    in_span = beats[(beats >= t0) & (beats < t1)]
+    step = BEATS_PER_PHOTO.get(tier, 2.0)
+    k = 0.0
+    while int(k) < len(in_span):
+        tick = float(in_span[int(k)])
+        tier_here = tier_at(tick) or tier
+        cand = [s for s in sel if abs(s - tick) <= SNAP_TOLERANCE_S and s not in used]
+        t = min(cand, key=lambda s: abs(s - tick)) if cand else tick
+        used.add(t)
+        if not out or t - out[-1][0] >= B._BURST_FLOOR_S:
+            out.append((t, tier_here))
+        k += BEATS_PER_PHOTO.get(tier_here, step)
+    return out
+
+
+MODES = {"fixed": None, "interval": interval_burst, "onstrike": one_per_strike,
+         "snap": snap_to_strike, "snaponly": snap_to_strike}
+
+# The way out of the bind "long spacing is boring, but photos between the notes
+# don't feel connected": cut on MORE OF THE REAL NOTES. Every cut stays on an
+# attack (100% on-strike, like the sections rated 5/5) and the pace rises,
+# because a solo piano plays far more notes than we currently detect -- most of
+# the peaks in the onset envelope never get a strike. These loosen the two knobs
+# that throw notes away: the prominence threshold (an ornament or a left-hand
+# note scores below 30% of the local p90) and the coalescing window (anything
+# inside 400ms of a louder neighbour is merged into it).
+SENSITIVITY = {           # name: (prom_frac, coalesce_s)
+    "dense": (0.15, 0.25),
+    "denser": (0.08, 0.18),
+}
 
 
 def instrumented_timeline(path: Path, n_photos: int = 1158, mode: str = "fixed"):
-    """Run the real pipeline, recording what each anchor span was handed."""
+    """Run the real pipeline, recording what each anchor span was handed.
+
+    A `mode` naming a SENSITIVITY preset also re-tunes strike detection, then
+    cuts one photo per strike -- the pace comes from finding more notes, not
+    from adding photos between them.
+    """
     calls: list[dict] = []
     orig = B._onset_anchor_cuts
-    impl = MODES[mode] or orig
+    orig_prom, orig_coal = B._prominent_strikes, B._coalesce_strikes
+    impl = MODES.get(mode) or (one_per_strike if mode in SENSITIVITY else orig)
+
+    if mode in SENSITIVITY:
+        prom_frac, coalesce_s = SENSITIVITY[mode]
+
+        def _prom(y, sr, *, prom_frac=prom_frac, rolling_s=4.0):
+            return orig_prom(y, sr, prom_frac=prom_frac, rolling_s=rolling_s)
+
+        def _coal(times, heights, min_gap=coalesce_s):
+            return orig_coal(times, heights, min_gap=coalesce_s)
+
+        B._prominent_strikes, B._coalesce_strikes = _prom, _coal
 
     def spy(span, strikes, tier_at, ambient_default="slow"):
         out = impl(span, strikes, tier_at, ambient_default)
@@ -132,16 +213,29 @@ def instrumented_timeline(path: Path, n_photos: int = 1158, mode: str = "fixed")
         })
         return out
 
+    # snap states the pace as a beat rate, so the GRID half has to be told the
+    # same rate -- otherwise it stays at 7.8 beats/photo and the 13x swing
+    # survives in the half of the track this function never touches.
+    extra = {}
+    if mode in ("snap", "snaponly"):
+        BEAT_TIMES["t"] = np.asarray(B._detect_beats(path)[0], dtype=float)
+    if mode == "snap":
+        # NOTE: forcing beat_speed also switches onset-anchoring off entirely
+        # (0 spans), so ambient loses its piano-attack cutting. "snaponly"
+        # isolates the snapping without that side effect.
+        extra["beat_speed"] = 1.0 / BEATS_PER_PHOTO["normal"]
+
     B._onset_anchor_cuts = spy
     try:
         tl = B.build_timeline(
             path,
             [datetime(2020, 1, 1) + timedelta(days=i * 2) for i in range(n_photos)],
             max_photos_per_second=4.0, min_photos_per_beat=1.0, vary_pace=True,
-            intense_multiplier=3.0, slow_multiplier=0.33,
+            intense_multiplier=3.0, slow_multiplier=0.33, **extra,
         )
     finally:
         B._onset_anchor_cuts = orig
+        B._prominent_strikes, B._coalesce_strikes = orig_prom, orig_coal
     return tl, calls
 
 
