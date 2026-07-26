@@ -695,6 +695,7 @@ def _collect_sources(
     min_face_fraction: float = 0.0,
     materialize_threshold: float = 0.50,
     force: bool = False,
+    max_per_day: int = 1,
 ) -> tuple[list[Path], list[datetime], list[str], list[_FaceHint], list[_AppleQuality], list[ManifestEntry], dict[date, list[_SourceItem]]]:
     """Collect and merge photo paths from all sources.
 
@@ -759,35 +760,38 @@ def _collect_sources(
             include_unmaterialized=True,
         )
 
-        # Record dedup losers before they're dropped, and keep them (best-first)
-        # as per-day fallbacks so a day whose winner fails alignment can be
-        # recovered from a runner-up instead of vanishing (issue #49).
-        from selfies_for_a_year.photos import pick_best_photo
-        by_day: dict[date, list] = {}
-        for p in all_photos:
-            by_day.setdefault(p.date.date(), []).append(p)
-        for day in sorted(by_day):
-            candidates = by_day[day]
-            if len(candidates) > 1:
-                best = pick_best_photo(candidates)
-                losers = sorted(
-                    (p for p in candidates if p is not best),
-                    key=lambda p: p.face_quality, reverse=True,
-                )
-                apple_fallbacks[day] = [
-                    (p.path, p.date,
-                     (p.face_center_x, p.face_center_y, p.face_size),
-                     (p.face_quality, p.tastefully_blurred))
-                    for p in losers
-                ]
-                for p in losers:
-                    manifest.append((
-                        p.date, p.path, "dropped",
-                        f"dedup: lost to {best.path.name} "
-                        f"(quality {p.face_quality:.3f} vs {best.face_quality:.3f})",
-                    ))
+        # In one-per-day mode, record dedup losers and keep them (best-first) as
+        # per-day fallbacks so a day whose winner fails alignment can be recovered
+        # from a runner-up instead of vanishing (issue #47). With max_per_day > 1
+        # the extra depth already provides same-day alternatives, so no separate
+        # fallback map is needed.
+        if max_per_day == 1:
+            from selfies_for_a_year.photos import pick_best_photo
+            by_day: dict[date, list] = {}
+            for p in all_photos:
+                by_day.setdefault(p.date.date(), []).append(p)
+            for day in sorted(by_day):
+                candidates = by_day[day]
+                if len(candidates) > 1:
+                    best = pick_best_photo(candidates)
+                    losers = sorted(
+                        (p for p in candidates if p is not best),
+                        key=lambda p: p.face_quality, reverse=True,
+                    )
+                    apple_fallbacks[day] = [
+                        (p.path, p.date,
+                         (p.face_center_x, p.face_center_y, p.face_size),
+                         (p.face_quality, p.tastefully_blurred))
+                        for p in losers
+                    ]
+                    for p in losers:
+                        manifest.append((
+                            p.date, p.path, "dropped",
+                            f"dedup: lost to {best.path.name} "
+                            f"(quality {p.face_quality:.3f} vs {best.face_quality:.3f})",
+                        ))
 
-        photos = deduplicate_by_day(all_photos)
+        photos = deduplicate_by_day(all_photos, max_per_day=max_per_day)
 
         # If too many originals live in iCloud, offer to screen derivatives
         # and materialize just the keepers to /tmp.
@@ -958,6 +962,17 @@ def compile(
             ),
         ),
     ] = 0.30,
+    max_per_day: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Max Apple Photos frames to keep per calendar day. Default 1 (one "
+                "selfie per day). Raise it for a subject whose photos cluster (many "
+                "on some days, none for weeks) so a fixed-length song can be filled "
+                "— at the cost of several same-day frames in a row. 0 = no cap."
+            ),
+        ),
+    ] = 1,
     manifest: Annotated[
         Path | None,
         typer.Option(
@@ -1050,6 +1065,7 @@ def compile(
         exclude=exclude_patterns,
         width=width, height=height,
         min_face_fraction=min_face_fraction, force=force,
+        max_per_day=max_per_day,
     )
 
     # Read audio length now so we can fit-to-music after alignment knows

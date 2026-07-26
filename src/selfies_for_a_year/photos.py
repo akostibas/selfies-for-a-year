@@ -285,18 +285,29 @@ def pick_best_photo(photos: list[PhotosImage]) -> PhotosImage:
 
 def deduplicate_by_day(
     photos: list[PhotosImage],
+    max_per_day: int = 1,
 ) -> list[PhotosImage]:
-    """Keep only the best photo per calendar day."""
+    """Keep the best `max_per_day` photos per calendar day, in time order.
+
+    Default 1 is the "selfies for a year" premise: one photo per day makes a
+    smooth daily progression. For a subject who isn't the daily-selfie person and
+    whose photos cluster (many on some days, none for weeks), a higher cap uses
+    more of the library so a fixed-length song can be filled — at the cost of
+    several same-day frames in a row. `max_per_day <= 0` keeps every photo.
+    """
     by_day: dict[date, list[PhotosImage]] = {}
     for photo in photos:
-        day = photo.date.date()
-        by_day.setdefault(day, []).append(photo)
+        by_day.setdefault(photo.date.date(), []).append(photo)
 
-    result = []
+    result: list[PhotosImage] = []
     for day in sorted(by_day):
         candidates = by_day[day]
-        result.append(
-            candidates[0] if len(candidates) == 1
-            else pick_best_photo(candidates)
-        )
+        if 0 < max_per_day < len(candidates):
+            # Keep the best N by quality, then restore chronological order so
+            # a day's burst still reads oldest-to-newest in the timeline.
+            candidates = sorted(
+                candidates, key=lambda p: p.face_quality, reverse=True
+            )[:max_per_day]
+            candidates = sorted(candidates, key=lambda p: p.date)
+        result.extend(candidates)
     return result
