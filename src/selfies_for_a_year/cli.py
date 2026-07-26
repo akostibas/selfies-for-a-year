@@ -695,12 +695,13 @@ def _collect_sources(
     min_face_fraction: float = 0.0,
     materialize_threshold: float = 0.50,
     force: bool = False,
-) -> tuple[list[Path], list[datetime], list[str], list[_FaceHint], list[_AppleQuality], list[ManifestEntry]]:
+) -> tuple[list[Path], list[datetime], list[str], list[_FaceHint], list[_AppleQuality], list[ManifestEntry], dict[date, list[_SourceItem]]]:
     """Collect and merge photo paths from all sources.
 
-    Returns (paths, labels, face_hints, apple_quality, manifest) sorted
-    chronologically, one photo per day, with selfie-dir photos taking
-    priority over Apple Photos.
+    Returns (paths, dates, labels, face_hints, apple_quality, manifest,
+    apple_fallbacks) sorted chronologically, one photo per day, with selfie-dir
+    photos taking priority over Apple Photos. `apple_fallbacks` maps a day to its
+    runner-up Apple candidates (best-first) for the align-aware fallback.
 
     Face hints: (center_x, center_y, size) for Apple Photos images (center as
     fractions of image dimensions, size as fraction of image area from the
@@ -730,6 +731,10 @@ def _collect_sources(
 
     # Collect Apple Photos
     photos_items: list[_SourceItem] = []
+    # Per-day runner-up candidates, best-quality-first, for the align-aware
+    # fallback: when the chosen photo for a day fails face alignment, compile
+    # retries these before giving the day up (see the fallback pass in `compile`).
+    apple_fallbacks: dict[date, list[_SourceItem]] = {}
     if apple_photos_name is not None:
         from selfies_for_a_year.photos import deduplicate_by_day, find_person, query_photos
 
@@ -754,7 +759,9 @@ def _collect_sources(
             include_unmaterialized=True,
         )
 
-        # Record dedup losers before they're dropped
+        # Record dedup losers before they're dropped, and keep them (best-first)
+        # as per-day fallbacks so a day whose winner fails alignment can be
+        # recovered from a runner-up instead of vanishing (issue #49).
         from selfies_for_a_year.photos import pick_best_photo
         by_day: dict[date, list] = {}
         for p in all_photos:
@@ -763,13 +770,22 @@ def _collect_sources(
             candidates = by_day[day]
             if len(candidates) > 1:
                 best = pick_best_photo(candidates)
-                for p in candidates:
-                    if p is not best:
-                        manifest.append((
-                            p.date, p.path, "dropped",
-                            f"dedup: lost to {best.path.name} "
-                            f"(quality {p.face_quality:.3f} vs {best.face_quality:.3f})",
-                        ))
+                losers = sorted(
+                    (p for p in candidates if p is not best),
+                    key=lambda p: p.face_quality, reverse=True,
+                )
+                apple_fallbacks[day] = [
+                    (p.path, p.date,
+                     (p.face_center_x, p.face_center_y, p.face_size),
+                     (p.face_quality, p.tastefully_blurred))
+                    for p in losers
+                ]
+                for p in losers:
+                    manifest.append((
+                        p.date, p.path, "dropped",
+                        f"dedup: lost to {best.path.name} "
+                        f"(quality {p.face_quality:.3f} vs {best.face_quality:.3f})",
+                    ))
 
         photos = deduplicate_by_day(all_photos)
 
@@ -858,7 +874,7 @@ def _collect_sources(
     labels = [_label_from_date(item[1]) if show_label else "" for item in all_items]
     face_hints = [item[2] for item in all_items]
     apple_quality = [item[3] for item in all_items]
-    return paths, dates, labels, face_hints, apple_quality, manifest
+    return paths, dates, labels, face_hints, apple_quality, manifest, apple_fallbacks
 
 
 @app.command()
@@ -1029,7 +1045,7 @@ def compile(
     # Collect photos from all sources
     typer.echo("Scanning sources ...")
     exclude_patterns = [s.strip() for s in exclude.split(",") if s.strip()] if exclude else None
-    paths, dates, labels, face_hints, apple_quality, manifest_entries = _collect_sources(
+    paths, dates, labels, face_hints, apple_quality, manifest_entries, apple_fallbacks = _collect_sources(
         input_dirs, apple_photos, year_range, label, since=since_date, until=until_date,
         exclude=exclude_patterns,
         width=width, height=height,
@@ -1084,11 +1100,47 @@ def compile(
             "no_usable_face": ("alignment found no usable face", 0),
         }
 
-        def _bump(gate: str) -> None:
+        def _bump(gate: str, delta: int = 1) -> None:
             desc, n = gate_drops[gate]
-            gate_drops[gate] = (desc, n + 1)
+            gate_drops[gate] = (desc, n + delta)
+
+        # Records which day/gate each Apple photo failed on, so the fallback pass
+        # can retry that day's runner-ups and, on success, credit the recovery
+        # back to the exact gate the winner tripped.
+        failed_apple: dict[date, tuple[str, str]] = {}  # day -> (label, gate)
 
         with FaceAligner(width, height) as aligner:
+            def _align_one(path, hint, apple):
+                """Pre-gates + face alignment for one photo. Returns
+                (aligned_img|None, gate_key|None, reason|None). Selfie-dir frames
+                (no hint/apple) bypass the cheap Apple gates — the user vetted
+                them. Pure w.r.t. accounting: the caller bumps counters/manifest."""
+                if (
+                    min_face_fraction > 0
+                    and hint is not None
+                    and hint[2] < min_face_fraction
+                ):
+                    return None, "tiny_face", (
+                        f"face area {hint[2]:.4f} < min-face-fraction {min_face_fraction}"
+                    )
+                if apple is not None and min_face_quality > 0 and apple[0] < min_face_quality:
+                    return None, "low_face_quality", (
+                        f"face quality {apple[0]:.3f} < min-face-quality {min_face_quality}"
+                    )
+                if (
+                    apple is not None
+                    and apple[1] is not None
+                    and max_tastefully_blurred > 0
+                    and apple[1] > max_tastefully_blurred
+                ):
+                    return None, "tastefully_blurred", (
+                        f"tastefully-blurred {apple[1]:.3f} > max {max_tastefully_blurred}"
+                    )
+                aligned = aligner.align(load_image(path), face_hint=hint)
+                if aligned is None:
+                    return None, "no_usable_face", "no usable face detected"
+                return aligned, None, None
+
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -1100,48 +1152,7 @@ def compile(
                 for path, dt, lbl, hint, apple in zip(
                     paths, dates, labels, face_hints, apple_quality
                 ):
-                    # Pre-filter Apple-sourced frames on cheap signals before
-                    # touching the image. Selfie-dir frames (no hint/apple)
-                    # bypass these gates since the user vetted them manually.
-                    if (
-                        min_face_fraction > 0
-                        and hint is not None
-                        and hint[2] < min_face_fraction
-                    ):
-                        _bump("tiny_face")
-                        manifest_entries.append((
-                            dt, path, "dropped",
-                            f"face area {hint[2]:.4f} < min-face-fraction {min_face_fraction}",
-                        ))
-                        progress.update(task, advance=1)
-                        continue
-                    if (
-                        apple is not None
-                        and min_face_quality > 0
-                        and apple[0] < min_face_quality
-                    ):
-                        _bump("low_face_quality")
-                        manifest_entries.append((
-                            dt, path, "dropped",
-                            f"face quality {apple[0]:.3f} < min-face-quality {min_face_quality}",
-                        ))
-                        progress.update(task, advance=1)
-                        continue
-                    if (
-                        apple is not None
-                        and apple[1] is not None
-                        and max_tastefully_blurred > 0
-                        and apple[1] > max_tastefully_blurred
-                    ):
-                        _bump("tastefully_blurred")
-                        manifest_entries.append((
-                            dt, path, "dropped",
-                            f"tastefully-blurred {apple[1]:.3f} > max {max_tastefully_blurred}",
-                        ))
-                        progress.update(task, advance=1)
-                        continue
-                    img = load_image(path)
-                    aligned_img = aligner.align(img, face_hint=hint)
+                    aligned_img, gate, reason = _align_one(path, hint, apple)
                     if aligned_img is not None:
                         prepared.append(aligned_img)
                         kept_labels.append(lbl)
@@ -1149,11 +1160,49 @@ def compile(
                         kept_paths.append(path)
                         manifest_entries.append((dt, path, "kept", ""))
                     else:
-                        _bump("no_usable_face")
-                        manifest_entries.append((
-                            dt, path, "dropped", "no usable face detected",
-                        ))
+                        _bump(gate)
+                        manifest_entries.append((dt, path, "dropped", reason))
+                        # An Apple photo (has a hint) that failed can be recovered
+                        # from a runner-up on the same day; remember the day + gate.
+                        if hint is not None and dt.date() in apple_fallbacks:
+                            failed_apple.setdefault(dt.date(), (lbl, gate))
                     progress.update(task, advance=1)
+
+            # --- Fallback pass: recover dropped days from same-day runner-ups ---
+            # A day whose best-quality photo failed alignment is not necessarily a
+            # day with no usable face — the winner is picked on Apple quality
+            # BEFORE mediapipe runs. Retry that day's other photos (best-first)
+            # until one aligns, so a stray no-face winner doesn't cost the day
+            # (issue #49). Extra alignment work is paid only for failed days.
+            recovered_fallback = 0
+            if failed_apple:
+                for day, (lbl, gate) in failed_apple.items():
+                    for fpath, fdt, fhint, fapple in apple_fallbacks.get(day, []):
+                        if not Path(fpath).exists():
+                            continue  # unmaterialized iCloud original; can't align
+                        aligned_img, _g, _r = _align_one(fpath, fhint, fapple)
+                        if aligned_img is not None:
+                            prepared.append(aligned_img)
+                            kept_labels.append(lbl)
+                            kept_dates.append(fdt)
+                            kept_paths.append(fpath)
+                            manifest_entries.append((
+                                fdt, fpath, "kept", "recovered via same-day fallback",
+                            ))
+                            _bump(gate, -1)  # the winner's drop is now made good
+                            recovered_fallback += 1
+                            break
+            if recovered_fallback:
+                # Recovered photos were appended out of order; restore date order.
+                order = sorted(range(len(kept_dates)), key=lambda i: kept_dates[i])
+                prepared = [prepared[i] for i in order]
+                kept_labels = [kept_labels[i] for i in order]
+                kept_dates = [kept_dates[i] for i in order]
+                kept_paths = [kept_paths[i] for i in order]
+                typer.echo(
+                    f"Recovered {recovered_fallback} day(s) via same-day fallback "
+                    "(winner failed alignment, a runner-up aligned)."
+                )
 
             if aligner.recovered_count:
                 typer.echo(
