@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Render a test video for one of the reference tracks, with the flags that are
+# actually correct. Exists because the compile interface has three traps that
+# cost a render cycle each to rediscover:
+#
+#   * the flag is --music, not --audio
+#   * the flag is --output, not -o
+#   * --music already implies --beat-sync (cli.py:982), and --beat-sync and
+#     --fit-to-music are mutually exclusive, so passing either explicitly errors
+#
+# Usage:
+#   bin/render-test home                 # 2026 only, --debug on, /tmp/home.mp4
+#   bin/render-test push --out /tmp/x.mp4
+#   bin/render-test home --all-years     # every year dir (needed to judge pace)
+#   bin/render-test home --production    # no --debug HUDs
+#
+# Any extra args are passed through to compile, so one-off knobs still work:
+#   bin/render-test home --intense-multiplier 4
+#
+# All machine-specific paths and the Apple Photos person name come from
+# local.env (gitignored) -- this repo is public and a pre-commit hook rejects
+# real names in tracked files.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT="$PWD"
+
+if [[ ! -f local.env ]]; then
+  echo "error: local.env missing (machine-specific paths). See CLAUDE.md." >&2
+  exit 1
+fi
+set -a; source local.env; set +a
+
+need() {
+  local var="$1" hint="$2"
+  if [[ -z "${!var:-}" ]]; then
+    echo "error: $var not set in local.env" >&2
+    echo "  add: $var=$hint" >&2
+    exit 1
+  fi
+}
+need PHOTOS_PERSON '"<first name as it appears in Apple Photos>"'
+need TRACK_HOME '"/path/to/To Build a Home.m4a"   # the ballad reference'
+need TRACK_PUSH '"/path/to/Push Upstairs.m4a"      # the driving reference'
+
+declare -A TRACKS=([home]="$TRACK_HOME" [push]="$TRACK_PUSH")
+
+track="${1:-}"
+if [[ -z "$track" || -z "${TRACKS[$track]:-}" ]]; then
+  echo "usage: bin/render-test <${!TRACKS[*]}> [--out PATH] [--all-years] [--production] [extra compile args]" >&2
+  exit 1
+fi
+shift
+
+music="${TRACKS[$track]}"
+[[ -f "$music" ]] || { echo "error: track not found: $music" >&2; exit 1; }
+
+out="/tmp/${track}.mp4"
+debug=(--debug)
+all_years=0
+extra=()
+while (($#)); do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    --all-years) all_years=1; shift ;;
+    --production) debug=(); shift ;;
+    *) extra+=("$1"); shift ;;
+  esac
+done
+
+# The face landmarker lives in the main checkout; a fresh worktree has no
+# models/ and the run dies after photo discovery with "Required model not
+# found". git-common-dir points at the main checkout's .git regardless of which
+# worktree we are in.
+if [[ ! -e models ]]; then
+  main_checkout="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
+  if [[ -d "$main_checkout/models" ]]; then
+    echo "note: linking models/ from $main_checkout"
+    ln -sfn "$main_checkout/models" "$ROOT/models"
+  else
+    echo "error: no models/ here or in $main_checkout" >&2
+    exit 1
+  fi
+fi
+
+# SELFIES_BASE is a per-YEAR archive whose folders hold everything from that
+# year -- scanned documents, cards, receipts -- with the selfies in a "<year>
+# selfies" subfolder. Globbing the year folders themselves feeds scanned
+# paperwork to the face pipeline (it shipped a greetings card into a render on
+# 2026-07-24), so match the selfie subfolders only.
+dirs=()
+if ((all_years)); then
+  for d in "$SELFIES_BASE"/*/*selfies*/; do [[ -d "$d" ]] && dirs+=("$d"); done
+  if ((${#dirs[@]} == 0)); then
+    echo "error: no '<year> selfies' folders under $SELFIES_BASE" >&2
+    exit 1
+  fi
+else
+  dirs=("$SELFIES_2026")
+fi
+
+log="${out%.mp4}.log"
+echo "track:   $track"
+echo "music:   $(basename "$music")"
+echo "inputs:  ${#dirs[@]} dir(s)$( ((all_years)) || echo ' (2026 only — pace judgements need --all-years)')"
+echo "debug:   $( ((${#debug[@]})) && echo 'on (4 HUDs)' || echo 'off (production)')"
+echo "output:  $out"
+echo "log:     $log"
+echo
+
+set +e
+uv run selfies-for-a-year compile "${dirs[@]}" \
+  --apple-photos "$PHOTOS_PERSON" \
+  --music "$music" \
+  --intense-multiplier 3 --slow-multiplier 0.33 \
+  --force "${debug[@]}" "${extra[@]}" \
+  --output "$out" >"$log" 2>&1
+rc=$?
+set -e
+
+if ((rc != 0)); then
+  echo "FAILED (exit $rc). Last 20 lines of $log:" >&2
+  tail -20 "$log" >&2
+  exit $rc
+fi
+
+dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2>/dev/null || echo '?')
+echo "OK  $out  ${dur}s  $(du -h "$out" | cut -f1)"
+echo
+echo "Next: append a row to docs/render-log.md (CLAUDE.md requires one per non-production render)."
