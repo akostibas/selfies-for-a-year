@@ -14,7 +14,7 @@ dependencies = [
     "rich>=14",
     "mediapipe>=0.10.35",
     "numpy>=2.4.4,<2.5",  # numba (via librosa) caps numpy<2.5; raise together when numba catches up
-    "pillow-heif>=1.4.0",
+    "pillow-heif>=1.5.0",
     "librosa>=0.11.0",
     "pyobjc-framework-photos>=12.2.1",
 ]
